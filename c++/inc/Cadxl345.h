@@ -11,6 +11,8 @@
 #include <iostream>
 using namespace std;
 
+#define ADXL345_SCALE_FACTOR    0.0039
+
 class Cadxl345Config : public CChipsetConfig {
 public:
     typedef enum Numerology {
@@ -20,9 +22,12 @@ public:
 	// registers map
 	ADXL345_DEVID           = 0x00 ,// R   Device ID.
 	ADXL345_THRESH_TAP      = 0x1D ,// R/W Tap threshold.
+
 	ADXL345_OFSX            = 0x1E ,// R/W X-axis offset.
 	ADXL345_OFSY            = 0x1F ,// R/W Y-axis offset.
 	ADXL345_OFSZ            = 0x20 ,// R/W Z-axis offset.
+	ADXL345_CALIBRATION_OFFSET = ADXL345_OFSX,
+
 	ADXL345_DUR             = 0x21 ,// R/W Tap duration.
 	ADXL345_LATENT          = 0x22 ,// R/W Tap latency.
 	ADXL345_WINDOW          = 0x23 ,// R/W Tap window.
@@ -48,13 +53,25 @@ public:
 	ADXL345_DATAZ1          = 0x37 ,// R   Z-Axis Data 1.
 	ADXL345_FIFO_CTL        = 0x38 ,// R/W FIFO control.
 	ADXL345_FIFO_STATUS     = 0x39 ,// R   FIFO status.
+
+	/* virtual stuff */
+	ADXL345_XYZ             = 0xfe,
 	ADXL345_CHIPSET         = 0xff ,// Full chipset
+
+
+	/* Ranges */
+	PlusMinus2G  = 0,
+	PlusMinus4G  = 1,
+	PlusMinus8G  = 2,
+	PlusMinus16G = 3,
 
 	ADXL345_NO_ERR = 0,
 	ERR_ADXL345_PAYLOAD_OOSYNC = -1,
 	ERR_ADXL345_XMITT_BUS_ERR = -2,
 	ERR_ADXL345_ACQUISITION_TIMEOUT = -3,
 	ERR_ADXL345_ACQUISITION_SYNC = -4,
+	ERR_ADXL345_RANGE_NOT_FOUND = -5,
+	ERR_OFFSET_OOSPEC = -6,
     }Numerology;
 
     Cadxl345Config( string file_spec );
@@ -64,13 +81,24 @@ protected:
 
 };
 
+
+
 class Cadxl345 : public CiicDevice, public Cadxl345Config
 {
 public:
     Cadxl345(int iic_address, string name, string config_spec = "./config/adxl345.xml");
+    vector <float> state();
+
+    int offset ( const vector<int> *offset );
+    int range  ( Numerology probe_range, bool full_resolution );
+    int sleep  ( bool val );
 
 protected:
+    int c2ToDec(int num, int num_size);
+    uint8_t DecToc2(int num);
     string report();
+    int active_range;
+    bool full_resolver;
 
     string err( int index = -1 );
     void ip_callback(socket_header_t *header, void *payload )
@@ -85,6 +113,7 @@ protected:
     typedef string (*register_decoder_t)(uint16_t);
     typedef tuple <  uint8_t*, string, register_decoder_t> register_spec_t;
     map <Numerology, register_spec_t> registers;
+
 };
 
 
