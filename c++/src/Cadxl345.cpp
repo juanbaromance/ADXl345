@@ -32,17 +32,18 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     Cadxl345Config( config_spec )
 {
     CiicDevice::bus_address( Cadxl345Config::CChipsetConfig::_bus_address );
-    registers[ ADXL345_DEVID      ] = register_spec_t( & dev_signature  , "Signature", 0 );
+    registers[ ADXL345_DEVID       ] = register_spec_t( & dev_signature  , "Signature", 0 );
 
-    registers[ ADXL345_BW_RATE    ] = register_spec_t( & rate_power_mode, "Rate-PowerMode", 0 );
-    registers[ ADXL345_INT_SOURCE ] = register_spec_t( & int_source     , "Interrupt source", 0 );
+    registers[ ADXL345_BW_RATE     ] = register_spec_t( & rate_power_mode, "Rate-PowerMode", 0 );
+    registers[ ADXL345_INT_SOURCE  ] = register_spec_t( & int_source     , "Interrupt source", 0 );
 
-    registers[ ADXL345_DATAX0     ] = register_spec_t( & lsb_x, "Xlow"  , 0 );
-    registers[ ADXL345_DATAX1     ] = register_spec_t( & msb_x, "Xhigh" , 0 );
-    registers[ ADXL345_DATAY0     ] = register_spec_t( & lsb_y, "Ylow"  , 0 );
-    registers[ ADXL345_DATAY1     ] = register_spec_t( & msb_y, "Yhigh" , 0 );
-    registers[ ADXL345_DATAZ0     ] = register_spec_t( & lsb_z, "Zlow"  , 0 );
-    registers[ ADXL345_DATAZ1     ] = register_spec_t( & msb_z, "Zhigh" , 0 );
+    registers[ ADXL345_DATAX0      ] = register_spec_t( & lsb_x, "Xlow"  , 0 );
+    registers[ ADXL345_DATAX1      ] = register_spec_t( & msb_x, "Xhigh" , 0 );
+    registers[ ADXL345_DATAY0      ] = register_spec_t( & lsb_y, "Ylow"  , 0 );
+    registers[ ADXL345_DATAY1      ] = register_spec_t( & msb_y, "Yhigh" , 0 );
+    registers[ ADXL345_DATAZ0      ] = register_spec_t( & lsb_z, "Zlow"  , 0 );
+    registers[ ADXL345_DATAZ1      ] = register_spec_t( & msb_z, "Zhigh" , 0 );
+    registers[ ADXL345_DATA_FORMAT ] = register_spec_t( & data_format, "DataFormat" , 0 );
     active_range = 2;
 
     int elapsed = 0;
@@ -77,15 +78,20 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
 
 vector<float> Cadxl345::state()
 {
-    static vector <float> tmp;
+#define GtoMsec2 9.8
+
+    static vector <float> tmp(3);
     receive( ADXL345_XYZ );
     if( _err == ADXL345_NO_ERR  )
     {
         float scaling = ADXL345_SCALE_FACTOR;
         scaling = full_resolver ? scaling : ( scaling * ( active_range >> 1 ) );
-        tmp.push_back( ( ( static_cast<short>(msb_x) << 8) + lsb_x ) * scaling );
-        tmp.push_back( ( ( static_cast<short>(msb_y) << 8) + lsb_y ) * scaling );
-        tmp.push_back( ( ( static_cast<short>(msb_z) << 8) + lsb_z ) * scaling );
+//        printf("$%02x%02x:%02x%02x:%02x%02x(%4.4f)( $%08x ) :: ",
+//               msb_x, lsb_x, msb_y, lsb_y, msb_z, lsb_z, scaling, data_format  );
+
+        tmp[0] = ( c2ToDec( ( static_cast<short>(msb_x) << 8) + lsb_x, 16 ) * scaling * GtoMsec2);
+        tmp[1] = ( c2ToDec( ( static_cast<short>(msb_y) << 8) + lsb_y, 16 ) * scaling * GtoMsec2);
+        tmp[2] = ( c2ToDec( ( static_cast<short>(msb_z) << 8) + lsb_z, 16 ) * scaling * GtoMsec2);
     }
     return( tmp );
 }
@@ -110,10 +116,13 @@ string Cadxl345::err(int index)
 {
     static map <int,string> err_table = {
         {ERR_ADXL345_XMITT_BUS_ERR ," # BusError on transmission"},
-        {ERR_ADXL345_PAYLOAD_OOSYNC," # Expected Payload :: out of sync"}
+        {ERR_ADXL345_PAYLOAD_OOSYNC," # Expected Payload :: out of sync"},
+        {ERR_ADXL345_RANGE_NOT_FOUND," # Dynamic G-Range unknown"}
     };
     index = ( index < 0 ) ? _err : index;
-    return( ( err_table.find( index ) == err_table.end() ) ? ( "unknown err(" + std::to_string(index) + ")" ) : err_table.find( index )->second );
+    return( ( err_table.find( index ) == err_table.end() )
+            ? ( "unknown err(" + std::to_string(index) + ")" )
+            : ( string("(ADXL345)") + err_table.find( index )->second ));
 
 }
 
@@ -145,6 +154,50 @@ int Cadxl345::sleep( bool val )
     return( _err );
 }
 
+int Cadxl345::tapping( Numerology mode, bitset<3> mask, int msec_duration , int msec_latency, int threshold, Numerology int_mapping )
+{
+
+}
+
+int Cadxl345::freefall(float mg_threshold, int msec_window, Cadxl345Config::Numerology pin )
+{
+    vector <uint8_t> payload;
+    payload.push_back( ADXL345_THRESH_FF );
+    payload.push_back( static_cast<int>( mg_threshold / 62.5) );
+    if( xmitt( payload ) < 0 )
+        return( _err );
+
+    payload.clear();
+    payload.push_back( ADXL345_THRESH_FF );
+    payload.push_back( static_cast<int>( msec_window / 5.0 ) );
+    if( xmitt( payload ) < 0 )
+        return( _err );
+
+    uint8_t aux, tmp = receive( ADXL345_INT_MAP );
+    aux = tmp & ( ~( 1 << 2 ) );
+    bool int_enabled = false;
+    if( ( pin == FreeFallPin1 ) || ( pin == FreeFallPin2 ) )
+    {
+        aux |= ( pin << 2 );
+        payload.clear();
+        payload.push_back( ADXL345_INT_MAP );
+        payload.push_back( aux);
+        if( xmitt( payload ) < 0 )
+            return( _err );
+        int_enabled = true;
+    }
+
+    tmp = receive( ADXL345_INT_ENABLE );
+    aux = tmp & ( ~( 1 << 2 ) );
+    aux |= ( int_enabled ? 1 : 0 ) << 2;
+    payload.clear();
+    payload.push_back( ADXL345_INT_ENABLE );
+    payload.push_back( aux );
+    xmitt( payload ) ;
+    return( _err );
+
+}
+
 int Cadxl345::offset(const vector<int> *offset )
 {
     if( offset->size() < 3 )
@@ -167,18 +220,25 @@ int Cadxl345::offset(const vector<int> *offset )
 
 int Cadxl345::range( Numerology probe_range, bool full_resolution )
 {
-    static map <Numerology,uint8_t> ranges = { { PlusMinus2G, 0} };
+    static map <Numerology,uint8_t> ranges = {
+        { PlusMinus2G , 0},
+        { PlusMinus4G , 1},
+        { PlusMinus8G , 2},
+        { PlusMinus16G, 3},
+    };
 
     if( ranges.find( probe_range ) == ranges.end() )
         return ( _err = ERR_ADXL345_RANGE_NOT_FOUND );
 
     uint8_t range = ranges.find( probe_range )->second;
-    uint8_t r_val = 0, tmp = receive( ADXL345_DATA_FORMAT );
+    uint8_t r_val = 0;
+
+    data_format = receive( ADXL345_DATA_FORMAT );
     if( _err != ADXL345_NO_ERR )
         return ( _err = ERR_ADXL345_PAYLOAD_OOSYNC );
 
 
-    r_val  = tmp & ( ~( 0x3 | ( 1 << 3 ) ) );
+    r_val  = data_format & ( ~( 0x3 | ( 1 << 3 ) ) );
     r_val |= range | ( ( full_resolution ? 1 : 0 ) << 3 );
     vector< uint8_t> payload;
     payload.push_back( ADXL345_DATA_FORMAT );
@@ -187,8 +247,10 @@ int Cadxl345::range( Numerology probe_range, bool full_resolution )
     {
         active_range = ( 1 << ( range + 1 ) );
         full_resolver = full_resolution;
+        data_format = receive( ADXL345_DATA_FORMAT );
     }
-    else _err = ERR_ADXL345_XMITT_BUS_ERR;
+    else
+        _err = ERR_ADXL345_XMITT_BUS_ERR;
     return( _err );
 }
 

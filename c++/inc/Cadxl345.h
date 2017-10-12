@@ -15,6 +15,27 @@ using namespace std;
 
 class Cadxl345Config : public CChipsetConfig {
 public:
+
+    typedef enum
+    {
+	ADXL345_DATARATE_3200_HZ    = 0b1111, // 1600Hz Bandwidth   140µA IDD
+	ADXL345_DATARATE_1600_HZ    = 0b1110, //  800Hz Bandwidth    90µA IDD
+	ADXL345_DATARATE_800_HZ     = 0b1101, //  400Hz Bandwidth   140µA IDD
+	ADXL345_DATARATE_400_HZ     = 0b1100, //  200Hz Bandwidth   140µA IDD
+	ADXL345_DATARATE_200_HZ     = 0b1011, //  100Hz Bandwidth   140µA IDD
+	ADXL345_DATARATE_100_HZ     = 0b1010, //   50Hz Bandwidth   140µA IDD
+	ADXL345_DATARATE_50_HZ      = 0b1001, //   25Hz Bandwidth    90µA IDD
+	ADXL345_DATARATE_25_HZ      = 0b1000, // 12.5Hz Bandwidth    60µA IDD
+	ADXL345_DATARATE_12_5_HZ    = 0b0111, // 6.25Hz Bandwidth    50µA IDD
+	ADXL345_DATARATE_6_25HZ     = 0b0110, // 3.13Hz Bandwidth    45µA IDD
+	ADXL345_DATARATE_3_13_HZ    = 0b0101, // 1.56Hz Bandwidth    40µA IDD
+	ADXL345_DATARATE_1_56_HZ    = 0b0100, // 0.78Hz Bandwidth    34µA IDD
+	ADXL345_DATARATE_0_78_HZ    = 0b0011, // 0.39Hz Bandwidth    23µA IDD
+	ADXL345_DATARATE_0_39_HZ    = 0b0010, // 0.20Hz Bandwidth    23µA IDD
+	ADXL345_DATARATE_0_20_HZ    = 0b0001, // 0.10Hz Bandwidth    23µA IDD
+	ADXL345_DATARATE_0_10_HZ    = 0b0000  // 0.05Hz Bandwidth    23µA IDD (default value)
+    } dataRate_t;
+
     typedef enum Numerology {
 
 	ADXL345_MAGIC           = 0xe5,
@@ -58,12 +79,16 @@ public:
 	ADXL345_XYZ             = 0xfe,
 	ADXL345_CHIPSET         = 0xff ,// Full chipset
 
-
 	/* Ranges */
-	PlusMinus2G  = 0,
-	PlusMinus4G  = 1,
-	PlusMinus8G  = 2,
-	PlusMinus16G = 3,
+	PlusMinus2G  = 0b00,
+	PlusMinus4G  = 0b01,
+	PlusMinus8G  = 0b10,
+	PlusMinus16G = 0b11,
+
+	/* Freefall  stuff */
+	FreeFallPin1 = 0,
+	FreeFallPin2 = 1,
+	FreeFallNoPin = 2,
 
 	ADXL345_NO_ERR = 0,
 	ERR_ADXL345_PAYLOAD_OOSYNC = -1,
@@ -89,9 +114,11 @@ public:
     Cadxl345(int iic_address, string name, string config_spec = "./config/adxl345.xml");
     vector <float> state();
 
-    int offset ( const vector<int> *offset );
-    int range  ( Numerology probe_range, bool full_resolution );
-    int sleep  ( bool val );
+    int offset   ( const vector<int> *offset );
+    int range    ( Numerology probe_range, bool full_resolution );
+    int sleep    ( bool val );
+    int freefall ( float mg_threshold = 500, int msec_window = 200, Numerology pin = FreeFallPin1 );
+    int tapping  ( Numerology mode, bitset<3> mask, int msec_duration, int msec_latency, int threshold, Numerology int_mapping);
 
 protected:
     int c2ToDec(int num, int num_size);
@@ -106,7 +133,7 @@ protected:
 	cout << _name << "." << __FUNCTION__ << " ## triggered" << endl;
     }
 
-    uint8_t dev_signature, rate_power_mode, int_source;
+    uint8_t dev_signature, rate_power_mode, int_source, data_format;
     uint8_t lsb_x, msb_x, lsb_y, msb_y, lsb_z, msb_z;
     uint8_t receive(Numerology offset);
 
