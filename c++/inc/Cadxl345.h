@@ -128,10 +128,7 @@ protected:
     bool full_resolver;
 
     string err( int index = -1 );
-    void ip_callback(socket_header_t *header, void *payload )
-    {
-	cout << _name << "." << __FUNCTION__ << " ## triggered" << endl;
-    }
+    void ip_callback(socket_header_t *header, void *payload );
 
     uint8_t dev_signature, rate_power_mode, int_source, data_format;
     uint8_t lsb_x, msb_x, lsb_y, msb_y, lsb_z, msb_z;
@@ -145,3 +142,5 @@ protected:
 
 
 #endif
+
+

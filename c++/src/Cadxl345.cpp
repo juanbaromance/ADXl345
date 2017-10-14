@@ -329,3 +329,13 @@ uint8_t Cadxl345::receive( Cadxl345Config::Numerology offset )
         _err = ERR_ADXL345_XMITT_BUS_ERR;
     return( tmp );
 }
+
+
+void Cadxl345::ip_callback(socket_header_t *header, void *payload)
+{
+    std::ostringstream oss;
+
+    oss << _name + string( __FUNCTION__ ) << "  :: id received :: " << hex << header->bit.msg_id;
+    operation_log( oss.str(), CiicDevice::Informer );
+
+}
