@@ -9,6 +9,8 @@
 #include <map>
 #include <tuple>
 #include <iostream>
+#include <thread>
+#include <common/raspberry_iface.h>
 using namespace std;
 
 #define ADXL345_SCALE_FACTOR    0.0039
@@ -103,12 +105,31 @@ public:
     int sync_configuration();
 
 protected:
-
+    dataRate_t  rate;
 };
 
+using namespace ADXL345IPNameSpace;
+class Cadxl345IPProfile {
+public:
+    Cadxl345IPProfile( RaspBerryIPSpecification profile_id = ADXL345Profile );
 
+protected:
+    ADXL345ProfileT profile;
+    int _profile_id;
+    int sync_peer();
+};
 
-class Cadxl345 : public CiicDevice, public Cadxl345Config
+class Activity {
+public:
+    virtual void resolver( void *payload ){ cout << "aieee" << endl;}
+};
+
+class AcquisitionSettings : public Activity {
+public:
+    void resolver( void *payload );
+};
+
+class Cadxl345 : public CiicDevice, public Cadxl345Config, public Cadxl345IPProfile
 {
 public:
     Cadxl345(int iic_address, string name, string config_spec = "./config/adxl345.xml");
@@ -120,27 +141,49 @@ public:
     int freefall ( float mg_threshold = 500, int msec_window = 200, Numerology pin = FreeFallPin1 );
     int tapping  ( Numerology mode, bitset<3> mask, int msec_duration, int msec_latency, int threshold, Numerology int_mapping);
 
+public:
+    static void settings( adxl345_payload::acquisition_t tmp );
+
+protected:
+    void monitor( );
+
 protected:
     int c2ToDec(int num, int num_size);
     uint8_t DecToc2(int num);
+    uint8_t receive(Numerology offset);
     string report();
-    int active_range;
-    bool full_resolver;
-
     string err( int index = -1 );
+    dataRate_t rate( dataRate_t probe );
     void ip_callback(socket_header_t *header, void *payload );
+
+    int active_range, peer_sampling;
+    bool full_resolver;
+    std::thread *t;
 
     uint8_t dev_signature, rate_power_mode, int_source, data_format;
     uint8_t lsb_x, msb_x, lsb_y, msb_y, lsb_z, msb_z;
-    uint8_t receive(Numerology offset);
 
     typedef string (*register_decoder_t)(uint16_t);
     typedef tuple <  uint8_t*, string, register_decoder_t> register_spec_t;
     map <Numerology, register_spec_t> registers;
 
+    typedef enum PrivateStuff
+    {
+	connection,
+	SRSpecification,
+    }PrivateStuff;
+
+    map< adxl345_operation, Activity*> profile_specification;
+    bitset<SRSpecification> sr;
+    static Cadxl345 *ghost;
 };
 
 
 #endif
+
+
+
+
+
 
 

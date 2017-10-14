@@ -7,6 +7,8 @@
 #include <chrono>
 #include <thread>
 #include "adxl345/Cadxl345.h"
+#include "common/raspberry_iface.h"
+#include "common/CNetworkSlot.h"
 #include <stdint.h>
 #include <cmath>
 #if __cplusplus==201103L
@@ -18,8 +20,8 @@ using namespace std;
 
 Cadxl345Config::Cadxl345Config(string file_spec) : CChipsetConfig( file_spec )
 {
-
-   sync_configuration();
+    rate = ADXL345_DATARATE_800_HZ;
+    sync_configuration();
 }
 
 int Cadxl345Config::sync_configuration()
@@ -27,10 +29,12 @@ int Cadxl345Config::sync_configuration()
 
 }
 
+Cadxl345 *Cadxl345::ghost;
 Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     CiicDevice( 0x53 | ( iic_address & 0xf ) ),
     Cadxl345Config( config_spec )
 {
+    ghost = this;
     CiicDevice::bus_address( Cadxl345Config::CChipsetConfig::_bus_address );
     registers[ ADXL345_DEVID       ] = register_spec_t( & dev_signature  , "Signature", 0 );
 
@@ -45,6 +49,7 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_DATAZ1      ] = register_spec_t( & msb_z, "Zhigh" , 0 );
     registers[ ADXL345_DATA_FORMAT ] = register_spec_t( & data_format, "DataFormat" , 0 );
     active_range = 2;
+    peer_sampling = 100;
 
     int elapsed = 0;
 
@@ -74,6 +79,9 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     string tmp = ( dev_signature == ADXL345_MAGIC ) ? " :: supported" : "";
     cout << "Actual chipset(0x" << hex << CChipsetConfig::_bus_address << ") state(" << _err << ")" << tmp + "(" + to_string(elapsed) + ")usec" << endl
          << report().c_str() << endl;
+
+    profile_specification[ ACQUISITION_SPEC ] =  new AcquisitionSettings();
+    t = new std::thread( & Cadxl345::monitor, this );
 }
 
 vector<float> Cadxl345::state()
@@ -112,6 +120,48 @@ string Cadxl345::report()
     return( CChipsetConfig::report() + oss.str() );
 }
 
+void Cadxl345::monitor()
+{
+
+    while( 1 )
+    {
+        int err_id;
+        std::this_thread::sleep_for(std::chrono::milliseconds( peer_sampling ));
+        if( sr[ connection ] == 0 )
+            continue;
+
+        bitset<32> mask;
+        mask.set(ACCELEROMETER_STATE);
+        profile.operation_mask = mask.to_ulong();
+        vector <float> g = state();
+        if( g.size() )
+        {
+            profile.payload.accelerometer.x = g[0];
+            profile.payload.accelerometer.y = g[1];
+            profile.payload.accelerometer.z = g[2];
+        }
+
+        if( ( err_id = sync_peer() ) < 0 )
+        {
+            std::ostringstream oss;
+            oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+            operation_log( oss.str(), CiicDevice::Warning );
+            continue;
+        }
+
+        {
+            CiicDevice::TraceLevelEnum report =
+                    ( _trace_level > 2  ) ? CiicDevice::Informer : CiicDevice::Silent;
+            std::ostringstream oss;
+            oss << typeid(this).name() <<  ".peer synced g(x,y,z) :: ";
+            for( auto sample : g )
+                oss << std::setw(2) << std::fixed << sample << " ";
+            operation_log( oss.str(), report );
+        }
+    }
+
+}
+
 string Cadxl345::err(int index)
 {
     static map <int,string> err_table = {
@@ -119,11 +169,29 @@ string Cadxl345::err(int index)
         {ERR_ADXL345_PAYLOAD_OOSYNC," # Expected Payload :: out of sync"},
         {ERR_ADXL345_RANGE_NOT_FOUND," # Dynamic G-Range unknown"}
     };
+
     index = ( index < 0 ) ? _err : index;
     return( ( err_table.find( index ) == err_table.end() )
             ? ( "unknown err(" + std::to_string(index) + ")" )
             : ( string("(ADXL345)") + err_table.find( index )->second ));
 
+}
+
+Cadxl345Config::dataRate_t Cadxl345::rate( Cadxl345Config::dataRate_t probe )
+{
+
+    uint8_t tmp = receive(ADXL345_BW_RATE);
+    if( _err != ADXL345_NO_ERR )
+        return( Cadxl345Config::rate );
+
+    vector <uint8_t> payload(2);
+    tmp &= 0x10;
+    tmp |= probe;
+    payload[0] = ADXL345_BW_RATE ;
+    payload[1] = tmp;
+    xmitt( payload );
+
+    return( Cadxl345Config::rate = static_cast<Cadxl345Config::dataRate_t>( receive(ADXL345_BW_RATE) ) );
 }
 
 
@@ -151,11 +219,58 @@ int Cadxl345::sleep( bool val )
     payload[0] = ADXL345_POWER_CTL;
     payload[1] = tmp;
     xmitt( payload );
+
+    rate( Cadxl345Config::rate );
+
+
     return( _err );
 }
 
+
 int Cadxl345::tapping( Numerology mode, bitset<3> mask, int msec_duration , int msec_latency, int threshold, Numerology int_mapping )
 {
+
+}
+
+void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
+{
+    if( tmp.msec < 10 )
+        return;
+
+    static map <float,dataRate_t> rates = {
+        { 3200, ADXL345_DATARATE_3200_HZ },
+        { 1600 ,ADXL345_DATARATE_1600_HZ },
+        {  800, ADXL345_DATARATE_800_HZ  },
+        {  400, ADXL345_DATARATE_400_HZ  },
+        {  200, ADXL345_DATARATE_200_HZ  },
+        {  100, ADXL345_DATARATE_100_HZ  },
+        {   50, ADXL345_DATARATE_50_HZ   },
+        {   25, ADXL345_DATARATE_25_HZ   },
+        {   12.5, ADXL345_DATARATE_12_5_HZ },
+        {    6.25, ADXL345_DATARATE_6_25HZ  },
+        {    3.13, ADXL345_DATARATE_3_13_HZ },
+        {    1.56, ADXL345_DATARATE_1_56_HZ },
+        {    0.78, ADXL345_DATARATE_0_78_HZ },
+        {    0.39, ADXL345_DATARATE_0_39_HZ },
+        {    0.20, ADXL345_DATARATE_0_20_HZ },
+        {    0.10, ADXL345_DATARATE_0_10_HZ }
+    };
+
+    dataRate_t probe_rate = ADXL345_DATARATE_0_10_HZ;
+    for( auto rate : rates )
+        if( rate.first < tmp.bandwidth )
+            probe_rate = rate.second;
+        else
+            break;
+
+    std::ostringstream oss;
+    oss << typeid(ghost).name() + string(".settings tweak :: ")
+        << std::setw(4) << ghost->peer_sampling << " to " << std::setw(4) << tmp.msec << "(msec)";
+    oss << " bandwidth ( " <<  std::scientific << tmp.bandwidth << " ) encoded as : " << probe_rate;
+    operation_log( oss.str(), CiicDevice::Informer );
+
+    ghost->peer_sampling = tmp.msec;
+    ghost->rate( probe_rate );
 
 }
 
@@ -251,6 +366,8 @@ int Cadxl345::range( Numerology probe_range, bool full_resolution )
     }
     else
         _err = ERR_ADXL345_XMITT_BUS_ERR;
+
+
     return( _err );
 }
 
@@ -331,11 +448,77 @@ uint8_t Cadxl345::receive( Cadxl345Config::Numerology offset )
 }
 
 
+
+
 void Cadxl345::ip_callback(socket_header_t *header, void *payload)
 {
-    std::ostringstream oss;
+    if( 0 )
+    {
+        std::ostringstream oss;
+        printf("%d::", header->bit.msg_id );
+        oss << _name + "." + string( __FUNCTION__ ) << "  :: id received :: " << hex << header->bit.msg_id;
+        operation_log( oss.str(), CiicDevice::Informer );
+    }
 
-    oss << _name + string( __FUNCTION__ ) << "  :: id received :: " << hex << header->bit.msg_id;
-    operation_log( oss.str(), CiicDevice::Informer );
+    switch( header->bit.msg_id )
+    {
 
+    case __PEER_HEARTBEAT_id:
+        break;
+
+    case ADXL345Profile:
+    {
+        ADXL345ProfileT *profile = (ADXL345ProfileT*)payload;
+        bitset<ProfileSpec> bits( profile->operation_mask );
+
+        for( int i = 0; i < bits.size(); i++ )
+        {
+            if( bits[ i ] )
+            {
+                adxl345_operation profile_id = static_cast<adxl345_operation>(i);
+                if( profile_specification.find( profile_id ) == profile_specification.end() )
+                    continue;
+                profile_specification.find( profile_id )->second->resolver( payload );
+            }
+        }
+    }
+        break;
+
+    case __KILL_CONNECTION_id:
+    {
+        sr.reset( connection );
+        std::ostringstream oss;
+        oss << typeid(this).name() + string(" # peer relase s a m p l e d");
+        operation_log( oss.str(), CiicDevice::Informer );
+     }
+        break;
+
+    case __FULL_DUPLEX_COMPLETED_id:
+    {
+        sr.set( connection );
+
+    }
+        break;
+
+    }
+
+
+}
+
+void AcquisitionSettings::resolver( void *payload )
+{
+   ADXL345ProfileT *profile_data = (ADXL345ProfileT *)payload;
+   Cadxl345::settings( profile_data->payload.acquisition );
+}
+
+
+
+Cadxl345IPProfile::Cadxl345IPProfile(RaspBerryIPSpecification profile_id) : _profile_id(profile_id)
+{
+
+}
+
+int Cadxl345IPProfile::sync_peer()
+{
+    return( CNetworkSlot::send( _profile_id, & profile, sizeof( profile ) ) );
 }
