@@ -10,10 +10,28 @@
 #include <tuple>
 #include <iostream>
 #include <thread>
+#include <cmath>
 #include <common/raspberry_iface.h>
 using namespace std;
+using namespace ADXL345IPNameSpace;
 
 #define ADXL345_SCALE_FACTOR    0.0039
+
+typedef struct StateT {
+    vector <float> v = vector <float>(5);
+    float x, y, z, pitch, roll;
+    StateT(){ operator()( 0, 0, 0); }
+
+    void operator()( float _x, float _y, float _z )
+    {
+	v[ X     ] = x =  _x;
+	v[ Y     ] = y =  _y;
+	v[ Z     ] = z =  _z;
+	v[ Pitch ] = pitch = atan2(x,  sqrt(y*y+z*z)) * 180.0 / M_PI;
+	v[ Roll  ] = roll  = atan2(y,  sqrt(x*x+z*z)) * 180.0 / M_PI;
+    }
+}StateT;
+
 
 class Cadxl345Config : public CChipsetConfig {
 public:
@@ -79,7 +97,8 @@ public:
 
 	/* virtual stuff */
 	ADXL345_XYZ             = 0xfe,
-	ADXL345_CHIPSET         = 0xff ,// Full chipset
+	ADXL345_CHIPSET         = 0xff  ,// Full chipset
+	ADXL345_GEOMETRY        = 0x1ff ,
 
 	/* Ranges */
 	PlusMinus2G  = 0b00,
@@ -105,6 +124,14 @@ public:
     int sync_configuration();
 
 protected:
+
+    typedef struct CalibDataT {
+	float offset, slope;
+	CalibDataT(){}
+	CalibDataT( float probe_offset, float probe_slope ) : offset( probe_offset ), slope( probe_slope ) {}
+    }CalibDataT;
+    vector <CalibDataT> calibration;
+
     dataRate_t  rate;
 };
 
@@ -132,6 +159,9 @@ public:
 class Cadxl345 : public CiicDevice, public Cadxl345Config, public Cadxl345IPProfile
 {
 public:
+
+
+
     Cadxl345(int iic_address, string name, string config_spec = "./config/adxl345.xml");
     vector <float> state();
 
@@ -148,20 +178,23 @@ protected:
     void monitor( );
 
 protected:
+    StateT _state;
+
     int c2ToDec(int num, int num_size);
     uint8_t DecToc2(int num);
     uint8_t receive(Numerology offset);
-    string report();
+    string  report (Numerology mux = ADXL345_CHIPSET );
     string err( int index = -1 );
     dataRate_t rate( dataRate_t probe );
     void ip_callback(socket_header_t *header, void *payload );
 
-    int active_range, peer_sampling;
+    int active_range, sampling;
     bool full_resolver;
     std::thread *t;
 
     uint8_t dev_signature, rate_power_mode, int_source, data_format;
     uint8_t lsb_x, msb_x, lsb_y, msb_y, lsb_z, msb_z;
+
 
     typedef string (*register_decoder_t)(uint16_t);
     typedef tuple <  uint8_t*, string, register_decoder_t> register_spec_t;

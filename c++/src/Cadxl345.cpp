@@ -21,6 +21,10 @@ using namespace std;
 Cadxl345Config::Cadxl345Config(string file_spec) : CChipsetConfig( file_spec )
 {
     rate = ADXL345_DATARATE_800_HZ;
+    calibration.resize(3);
+    for( auto & calib : calibration )
+        calib = CalibDataT(0,1);
+
     sync_configuration();
 }
 
@@ -49,7 +53,9 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_DATAZ1      ] = register_spec_t( & msb_z, "Zhigh" , 0 );
     registers[ ADXL345_DATA_FORMAT ] = register_spec_t( & data_format, "DataFormat" , 0 );
     active_range = 2;
-    peer_sampling = 100;
+    sampling = 100;
+
+
 
     int elapsed = 0;
 
@@ -100,47 +106,80 @@ vector<float> Cadxl345::state()
         tmp[0] = ( c2ToDec( ( static_cast<short>(msb_x) << 8) + lsb_x, 16 ) * scaling * GtoMsec2);
         tmp[1] = ( c2ToDec( ( static_cast<short>(msb_y) << 8) + lsb_y, 16 ) * scaling * GtoMsec2);
         tmp[2] = ( c2ToDec( ( static_cast<short>(msb_z) << 8) + lsb_z, 16 ) * scaling * GtoMsec2);
+
+        int i;
+        for( auto & acc : tmp )
+        {
+            CalibDataT *c = & calibration[ i++ ];
+            acc = acc * c->slope + c->offset;
+        }
+        _state( tmp[ X ], tmp[ Y ], tmp[ Z ] );
+
     }
     return( tmp );
 }
 
-string Cadxl345::report()
+string Cadxl345::report(Numerology mux)
 {
+
     std::ostringstream oss;
-    for( auto r: registers )
+    if( mux == ADXL345_CHIPSET )
     {
-        uint8_t *r_val;
-        string r_name;
-        tie( r_val, r_name, ignore ) = r.second;
-        oss << setfill(' ') << setw(25) << r_name
-            << " register( $"
-            << setw(3) << setfill('0') << hex << r.first  << ") :: $"
-            << setw(3) << setfill('0') << hex << bitset<8>(*r_val).to_ulong() << endl;
+        for( const auto & r: registers )
+        {
+            uint8_t *r_val;
+            string r_name;
+            tie( r_val, r_name, ignore ) = r.second;
+            oss << setfill(' ') << setw(25) << r_name
+                << " register( $"
+                << setw(3) << setfill('0') << hex << r.first  << ") :: $"
+                << setw(3) << setfill('0') << hex << bitset<8>(*r_val).to_ulong() << endl;
+        }
+    }
+    else if ( mux == ADXL345_GEOMETRY )
+    {
+
+        CiicDevice::TraceLevelEnum report =
+                ( _trace_level > -2  ) ? CiicDevice::Informer : CiicDevice::Silent;
+        oss << typeid(this).name() <<  " g(x,y,z,pitch,roll) :: ";
+        for( const auto & sample : _state.v )
+            oss << setw(10) << std::fixed << std::right << sample << " ";
+        operation_log( oss.str(), report );
+
     }
     return( CChipsetConfig::report() + oss.str() );
 }
 
 void Cadxl345::monitor()
 {
+    {
+        std::ostringstream oss;
+        oss << typeid(this).name() <<  __FUNCTION__ << "running device sampling :: " + to_string(sampling) + "(msec)";
+        operation_log( oss.str(), CiicDevice::Informer );
+    }
 
     while( 1 )
     {
         int err_id;
-        std::this_thread::sleep_for(std::chrono::milliseconds( peer_sampling ));
+        std::this_thread::sleep_for(std::chrono::milliseconds( sampling ));
+
+
+        if( state().size() )
+        {
+            profile.payload.accelerometer.x     = _state.x;
+            profile.payload.accelerometer.y     = _state.y;
+            profile.payload.accelerometer.z     = _state.z;
+            profile.payload.accelerometer.pitch = _state.pitch;
+            profile.payload.accelerometer.roll  = _state.roll;
+            report(ADXL345_GEOMETRY);
+        }
+
         if( sr[ connection ] == 0 )
             continue;
 
         bitset<32> mask;
         mask.set(ACCELEROMETER_STATE);
         profile.operation_mask = mask.to_ulong();
-        vector <float> g = state();
-        if( g.size() )
-        {
-            profile.payload.accelerometer.x = g[0];
-            profile.payload.accelerometer.y = g[1];
-            profile.payload.accelerometer.z = g[2];
-        }
-
         if( ( err_id = sync_peer() ) < 0 )
         {
             std::ostringstream oss;
@@ -149,15 +188,6 @@ void Cadxl345::monitor()
             continue;
         }
 
-        {
-            CiicDevice::TraceLevelEnum report =
-                    ( _trace_level > 2  ) ? CiicDevice::Informer : CiicDevice::Silent;
-            std::ostringstream oss;
-            oss << typeid(this).name() <<  ".peer synced g(x,y,z) :: ";
-            for( auto sample : g )
-                oss << std::setw(2) << std::fixed << sample << " ";
-            operation_log( oss.str(), report );
-        }
     }
 
 }
@@ -257,7 +287,7 @@ void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
     };
 
     dataRate_t probe_rate = ADXL345_DATARATE_0_10_HZ;
-    for( auto rate : rates )
+    for( const auto & rate : rates )
         if( rate.first < tmp.bandwidth )
             probe_rate = rate.second;
         else
@@ -265,11 +295,11 @@ void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
 
     std::ostringstream oss;
     oss << typeid(ghost).name() + string(".settings tweak :: ")
-        << std::setw(4) << ghost->peer_sampling << " to " << std::setw(4) << tmp.msec << "(msec)";
+        << std::setw(4) << ghost->sampling << " to " << std::setw(4) << tmp.msec << "(msec)";
     oss << " bandwidth ( " <<  std::scientific << tmp.bandwidth << " ) encoded as : " << probe_rate;
     operation_log( oss.str(), CiicDevice::Informer );
 
-    ghost->peer_sampling = tmp.msec;
+    ghost->sampling = tmp.msec;
     ghost->rate( probe_rate );
 
 }
@@ -320,7 +350,7 @@ int Cadxl345::offset(const vector<int> *offset )
 
     vector <uint8_t> payload(2);
     int i = 0;
-    for( auto val : *offset )
+    for( const auto & val : *offset )
     {
         float tmp = val / 15.6;
         payload[0] = ADXL345_CALIBRATION_OFFSET + i;
@@ -397,7 +427,7 @@ uint8_t Cadxl345::receive( Cadxl345Config::Numerology offset )
     if( offset == ADXL345_CHIPSET )
     {
          uint8_t tmp = -1;
-         for( auto r: registers )
+         for( const auto & r: registers )
              receive( r.first );
          return( tmp );
     }
