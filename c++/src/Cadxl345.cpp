@@ -207,7 +207,7 @@ void Cadxl345::monitor()
 {
     {
         std::ostringstream oss;
-        oss << typeid(this).name() <<  __FUNCTION__ << "running device sampling :: " + to_string(sampling) + "(msec)";
+        oss << typeid(this).name() << "." << __FUNCTION__ << " :: running device sampling :: " + to_string(sampling) + "(msec)";
         operation_log( oss.str(), CiicDevice::Informer );
     }
 
@@ -293,19 +293,29 @@ Cadxl345Config::dataRate_t Cadxl345::rate( Cadxl345Config::dataRate_t probe )
 
 int Cadxl345::sleep( bool val )
 {
-    uint8_t tmp = receive( ADXL345_POWER_CTL );
+    Numerology r = ADXL345_POWER_CTL;
+    uint8_t tmp = receive( r);
     if( _err != ADXL345_NO_ERR )
         return( _err );
 
+    vector <uint8_t> payload(2);
+    payload[0] = r;
+
     if( val )
     {
-        tmp &= ~(PCTL_AUTO_SLEEP | PCTL_LINK);
+        tmp &= ~(PCTL_LINK | PCTL_MEASURE );
+        tmp |= (PCTL_AUTO_SLEEP|PCTL_SLEEP);
     }
     else
-        tmp |=  PCTL_AUTO_SLEEP | PCTL_LINK;
-    tmp |= PCTL_MEASURE * ( val ? 0 : 1 );
-    vector <uint8_t> payload(2);
-    payload[0] = ADXL345_POWER_CTL;
+    {
+        tmp &= ~(PCTL_SLEEP|PCTL_AUTO_SLEEP|PCTL_MEASURE);
+        payload[1] = tmp;
+        xmitt( payload );
+        wait(1000);
+        tmp |= PCTL_MEASURE;
+    }
+
+
     payload[1] = tmp;
     xmitt( payload );
 
@@ -323,7 +333,10 @@ int Cadxl345::tapping( Numerology mode, bitset<3> mask, int msec_duration , int 
 
 void Cadxl345::sleep( adxl345_payload::sleep_t tmp )
 {
-
+    std::ostringstream oss;
+    oss << typeid(ghost).name() <<  ".sleep : " << ( tmp.enable ? "entering" : "exit" );
+    operation_log(oss.str(), Informer );
+    ghost->sleep( tmp.enable );
 }
 
 void Cadxl345::autoprobe( bool enable )
