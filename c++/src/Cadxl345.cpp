@@ -18,6 +18,9 @@
 
 using namespace std;
 
+
+
+
 Cadxl345Config::Cadxl345Config(string file_spec) : CChipsetConfig( file_spec )
 {
     rate = ADXL345_DATARATE_800_HZ;
@@ -32,6 +35,37 @@ int Cadxl345Config::sync_configuration()
 {
 
 }
+
+
+
+
+class AcquisitionSettings : public Activity {
+public:
+    void resolver( void *payload )
+    {
+        ADXL345ProfileT *profile_data = (ADXL345ProfileT *)payload;
+        Cadxl345::settings( profile_data->payload.acquisition );
+    }
+};
+
+class SleepSettings : public Activity {
+public:
+    void resolver( void *payload )
+    {
+        ADXL345ProfileT *tmp = ( ADXL345ProfileT* )payload;
+        Cadxl345::sleep( tmp->payload.sleep );
+    }
+};
+
+class SelfTesting: public Activity {
+public:
+    void resolver( void *payload )
+    {
+        ADXL345ProfileT *tmp = ( ADXL345ProfileT* )payload;
+        Cadxl345::autoprobe( tmp->payload.enable );
+    }
+};
+
 
 Cadxl345 *Cadxl345::ghost;
 Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
@@ -54,7 +88,7 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_DATA_FORMAT ] = register_spec_t( & data_format, "DataFormat" , 0 );
     active_range = 2;
     sampling = 100;
-
+    raw_acquistition = false;
 
 
     int elapsed = 0;
@@ -86,7 +120,10 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     cout << "Actual chipset(0x" << hex << CChipsetConfig::_bus_address << ") state(" << _err << ")" << tmp + "(" + to_string(elapsed) + ")usec" << endl
          << report().c_str() << endl;
 
-    profile_specification[ ACQUISITION_SPEC ] =  new AcquisitionSettings();
+    profile_specification[ ACQUISITION_SPEC ] = new AcquisitionSettings();
+    profile_specification[ SELF_TESTING     ] = new SelfTesting();
+    profile_specification[ SLEEP_SPEC       ] = new SleepSettings();
+
     t = new std::thread( & Cadxl345::monitor, this );
 }
 
@@ -103,9 +140,16 @@ vector<float> Cadxl345::state()
 //        printf("$%02x%02x:%02x%02x:%02x%02x(%4.4f)( $%08x ) :: ",
 //               msb_x, lsb_x, msb_y, lsb_y, msb_z, lsb_z, scaling, data_format  );
 
-        tmp[0] = ( c2ToDec( ( static_cast<short>(msb_x) << 8) + lsb_x, 16 ) * scaling * GtoMsec2);
-        tmp[1] = ( c2ToDec( ( static_cast<short>(msb_y) << 8) + lsb_y, 16 ) * scaling * GtoMsec2);
-        tmp[2] = ( c2ToDec( ( static_cast<short>(msb_z) << 8) + lsb_z, 16 ) * scaling * GtoMsec2);
+        tmp[0] = c2ToDec( ( static_cast<short>(msb_x) << 8) + lsb_x, 16 );
+        tmp[1] = c2ToDec( ( static_cast<short>(msb_y) << 8) + lsb_y, 16 );
+        tmp[2] = c2ToDec( ( static_cast<short>(msb_z) << 8) + lsb_z, 16 );
+
+        if( raw_acquistition == false )
+        {
+            tmp[0] *= scaling * GtoMsec2;
+            tmp[1] *= scaling * GtoMsec2;
+            tmp[2] *= scaling * GtoMsec2;
+        }
 
         int i;
         for( auto & acc : tmp )
@@ -141,9 +185,18 @@ string Cadxl345::report(Numerology mux)
 
         CiicDevice::TraceLevelEnum report =
                 ( _trace_level > -2  ) ? CiicDevice::Informer : CiicDevice::Silent;
-        oss << typeid(this).name() <<  " g(x,y,z,pitch,roll) :: ";
-        for( const auto & sample : _state.v )
-            oss << setw(10) << std::fixed << std::right << sample << " ";
+        oss << typeid(this).name();
+
+        if( raw_acquistition == false )
+        {
+            oss << " g(x,y,z,pitch,roll) :: ";
+            for( const auto & sample : _state.v )
+                oss << setw(10) << std::fixed << std::right << sample << " ";
+        }
+        else
+        {
+            oss << " counts(x,y,z) :: " << _state.x << " " << _state.y << " " << _state.z;
+        }
         operation_log( oss.str(), report );
 
     }
@@ -158,11 +211,12 @@ void Cadxl345::monitor()
         operation_log( oss.str(), CiicDevice::Informer );
     }
 
+    int elapsed = 0;
     while( 1 )
     {
         int err_id;
         std::this_thread::sleep_for(std::chrono::milliseconds( sampling ));
-
+        elapsed += sampling;
 
         if( state().size() )
         {
@@ -171,7 +225,12 @@ void Cadxl345::monitor()
             profile.payload.accelerometer.z     = _state.z;
             profile.payload.accelerometer.pitch = _state.pitch;
             profile.payload.accelerometer.roll  = _state.roll;
-            report(ADXL345_GEOMETRY);
+
+            if( sr[ connection ] == 0 )
+            {
+                if( ! ( elapsed % 1000 ) )
+                    report(ADXL345_GEOMETRY);
+            }
         }
 
         if( sr[ connection ] == 0 )
@@ -262,6 +321,42 @@ int Cadxl345::tapping( Numerology mode, bitset<3> mask, int msec_duration , int 
 
 }
 
+void Cadxl345::sleep( adxl345_payload::sleep_t tmp )
+{
+
+}
+
+void Cadxl345::autoprobe( bool enable )
+{
+    Numerology r = ADXL345_DATA_FORMAT;
+    enum {
+        FullResolutionBit = 3,
+        SelfTestingBit = 7
+    };
+    uint8_t tmp = ghost->receive( r );
+    vector <uint8_t> payload(2);
+    tmp &= ~( 1 << SelfTestingBit );
+    tmp &= ~( 1 << FullResolutionBit );
+
+    tmp |= ( enable ? 1 : 0 ) << SelfTestingBit;
+    tmp |= ( enable ? 0 : 1 ) << FullResolutionBit;
+
+    ghost->raw_acquistition= enable;
+    payload[0] = r ;
+    payload[1] = tmp;
+    ghost->xmitt( payload );
+
+    std::ostringstream oss;
+    oss << typeid(ghost).name() + string(".autoprobe(10bits) :: ") << ( enable ? "toggled" : "untoggled" );
+    operation_log( oss.str(), Informer );
+
+}
+
+void Cadxl345::tapping(adxl345_payload::tap_t tmp)
+{
+
+}
+
 void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
 {
     if( tmp.msec < 10 )
@@ -303,6 +398,7 @@ void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
     ghost->rate( probe_rate );
 
 }
+
 
 int Cadxl345::freefall(float mg_threshold, int msec_window, Cadxl345Config::Numerology pin )
 {
@@ -366,10 +462,10 @@ int Cadxl345::offset(const vector<int> *offset )
 int Cadxl345::range( Numerology probe_range, bool full_resolution )
 {
     static map <Numerology,uint8_t> ranges = {
-        { PlusMinus2G , 0},
-        { PlusMinus4G , 1},
-        { PlusMinus8G , 2},
-        { PlusMinus16G, 3},
+        { PlusMinus1G , 0},
+        { PlusMinus2G , 1},
+        { PlusMinus4G , 2},
+        { PlusMinus8G , 3},
     };
 
     if( ranges.find( probe_range ) == ranges.end() )
@@ -535,11 +631,6 @@ void Cadxl345::ip_callback(socket_header_t *header, void *payload)
 
 }
 
-void AcquisitionSettings::resolver( void *payload )
-{
-   ADXL345ProfileT *profile_data = (ADXL345ProfileT *)payload;
-   Cadxl345::settings( profile_data->payload.acquisition );
-}
 
 
 

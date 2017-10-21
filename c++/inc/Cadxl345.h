@@ -15,7 +15,7 @@
 using namespace std;
 using namespace ADXL345IPNameSpace;
 
-#define ADXL345_SCALE_FACTOR    0.0039
+#define ADXL345_SCALE_FACTOR    0.00195
 
 typedef struct StateT {
     vector <float> v = vector <float>(5);
@@ -101,10 +101,10 @@ public:
 	ADXL345_GEOMETRY        = 0x1ff ,
 
 	/* Ranges */
-	PlusMinus2G  = 0b00,
-	PlusMinus4G  = 0b01,
-	PlusMinus8G  = 0b10,
-	PlusMinus16G = 0b11,
+	PlusMinus1G  = 0b00,
+	PlusMinus2G  = 0b01,
+	PlusMinus4G  = 0b10,
+	PlusMinus8G  = 0b11,
 
 	/* Freefall  stuff */
 	FreeFallPin1 = 0,
@@ -151,10 +151,6 @@ public:
     virtual void resolver( void *payload ){ cout << "aieee" << endl;}
 };
 
-class AcquisitionSettings : public Activity {
-public:
-    void resolver( void *payload );
-};
 
 class Cadxl345 : public CiicDevice, public Cadxl345Config, public Cadxl345IPProfile
 {
@@ -172,7 +168,10 @@ public:
     int tapping  ( Numerology mode, bitset<3> mask, int msec_duration, int msec_latency, int threshold, Numerology int_mapping);
 
 public:
-    static void settings( adxl345_payload::acquisition_t tmp );
+    static void settings  ( adxl345_payload::acquisition_t tmp );
+    static void sleep     ( adxl345_payload::sleep_t tmp );
+    static void autoprobe ( bool enable );
+    static void tapping   ( adxl345_payload::tap_t tmp );
 
 protected:
     void monitor( );
@@ -189,19 +188,17 @@ protected:
     void ip_callback(socket_header_t *header, void *payload );
 
     int active_range, sampling;
-    bool full_resolver;
+    bool full_resolver, raw_acquistition;
     std::thread *t;
 
     uint8_t dev_signature, rate_power_mode, int_source, data_format;
     uint8_t lsb_x, msb_x, lsb_y, msb_y, lsb_z, msb_z;
 
-
     typedef string (*register_decoder_t)(uint16_t);
     typedef tuple <  uint8_t*, string, register_decoder_t> register_spec_t;
     map <Numerology, register_spec_t> registers;
 
-    typedef enum PrivateStuff
-    {
+    typedef enum PrivateStuff {
 	connection,
 	SRSpecification,
     }PrivateStuff;
@@ -213,6 +210,8 @@ protected:
 
 
 #endif
+
+
 
 
 
