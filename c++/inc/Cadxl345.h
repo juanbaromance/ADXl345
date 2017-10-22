@@ -12,6 +12,10 @@
 #include <thread>
 #include <cmath>
 #include <common/raspberry_iface.h>
+#include <common/CStatistic.h>
+#include <mutex>
+#include <condition_variable>
+
 using namespace std;
 using namespace ADXL345IPNameSpace;
 
@@ -99,6 +103,7 @@ public:
 	ADXL345_XYZ             = 0xfe,
 	ADXL345_CHIPSET         = 0xff  ,// Full chipset
 	ADXL345_GEOMETRY        = 0x1ff ,
+	ADXL345_AUTOSLEEP       = 0x200 , // ACT_INACT_CTL, THRESH_ACT, THRESH_INACT, TIME_INACT, INT_ENABLE, INT_MAP
 
 	/* Ranges */
 	PlusMinus1G  = 0b00,
@@ -118,6 +123,11 @@ public:
 	ERR_ADXL345_ACQUISITION_SYNC = -4,
 	ERR_ADXL345_RANGE_NOT_FOUND = -5,
 	ERR_OFFSET_OOSPEC = -6,
+
+	/* AutoProbe phases */
+	AUTOPROBE_OFFSET,
+	AUTOPROBE_LOAD,
+
     }Numerology;
 
     Cadxl345Config( string file_spec );
@@ -144,6 +154,7 @@ protected:
     ADXL345ProfileT profile;
     int _profile_id;
     int sync_peer();
+    std::mutex ip_mtx;
 };
 
 class Activity {
@@ -156,16 +167,15 @@ class Cadxl345 : public CiicDevice, public Cadxl345Config, public Cadxl345IPProf
 {
 public:
 
-
-
     Cadxl345(int iic_address, string name, string config_spec = "./config/adxl345.xml");
     vector <float> state();
 
-    int offset   ( const vector<int> *offset );
-    int range    ( Numerology probe_range, bool full_resolution );
-    int sleep    ( bool val );
-    int freefall ( float mg_threshold = 500, int msec_window = 200, Numerology pin = FreeFallPin1 );
-    int tapping  ( Numerology mode, bitset<3> mask, int msec_duration, int msec_latency, int threshold, Numerology int_mapping);
+    int offset    ( const vector<int> *payload );
+    int range     ( Numerology probe_range, bool full_resolution );
+    int sleep     ( bool val );
+    int autosleep ( adxl345_payload::sleep_t parameters );
+    int freefall  ( float mg_threshold = 500, int msec_window = 200, Numerology pin = FreeFallPin1 );
+    int tapping   ( Numerology mode, bitset<3> mask, int msec_duration, int msec_latency, int threshold, Numerology int_mapping);
 
 public:
     static void settings  ( adxl345_payload::acquisition_t tmp );
@@ -175,24 +185,30 @@ public:
 
 protected:
     void monitor( );
+    void autoprobe( Numerology phase );
 
 protected:
     StateT _state;
+    vector < vector <float> > buffer;
 
     int c2ToDec(int num, int num_size);
     uint8_t DecToc2(int num);
-    uint8_t receive(Numerology offset);
-    string  report (Numerology mux = ADXL345_CHIPSET );
+    uint8_t receive( Numerology index );
+    int xmitt(uint8_t r_index, uint8_t val);
+    string  report ( Numerology mux = ADXL345_CHIPSET );
     string err( int index = -1 );
     dataRate_t rate( dataRate_t probe );
     void ip_callback(socket_header_t *header, void *payload );
 
     int active_range, sampling;
-    bool full_resolver, raw_acquistition;
+    bool full_resolver, raw_acquistition, autoprobing;
     std::thread *t;
 
     uint8_t dev_signature, rate_power_mode, int_source, data_format;
     uint8_t lsb_x, msb_x, lsb_y, msb_y, lsb_z, msb_z;
+    uint8_t irq_enable, irq_map;
+    uint8_t autosleep_control, threshold_activity, threshold_inactivity, window_inactivity;
+    float scaling;
 
     typedef string (*register_decoder_t)(uint16_t);
     typedef tuple <  uint8_t*, string, register_decoder_t> register_spec_t;
@@ -205,7 +221,14 @@ protected:
 
     map< adxl345_operation, Activity*> profile_specification;
     bitset<SRSpecification> sr;
+
+    typedef tuple<int,int> range_t;
+    vector <range_t> self_test;
+
+    vector <CStatistic> offset_buffer;
+
     static Cadxl345 *ghost;
+
 };
 
 
