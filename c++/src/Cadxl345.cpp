@@ -107,6 +107,7 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_WINDOW_INACT  ] = register_spec_t( & window_inactivity   , "Rest(sec)" , 0 );
     registers[ ADXL345_INT_ENABLE    ] = register_spec_t( & irq_enable          , "irq control" , 0 );
     registers[ ADXL345_INT_MAP       ] = register_spec_t( & irq_map             , "irq mapping" , 0 );
+    registers[ ADXL345_POWER_CTL       ] = register_spec_t( & power_csr            ,"power-control", 0 );
 
     scaling = ADXL345_SCALE_FACTOR;
     offset_buffer = { CStatistic("Xoff"), CStatistic("Yoff"), CStatistic("Zoff") };
@@ -366,6 +367,15 @@ int Cadxl345::autosleep( adxl345_payload::sleep_t parameters )
     oss << typeid(ghost).name() << ".autosleep # " << endl;
     receive( ADXL345_AUTOSLEEP );
 
+
+    power_csr &= ~( 1 << 4 );
+    power_csr |=  ( parameters.enable ? 1 : 0 ) << 4;
+    if( parameters.enable == false )
+    {
+        if( xmitt( ADXL345_POWER_CTL, power_csr ) < 0 )
+        return( _err );
+    }
+
     float scaler = 31.2;
     uint8_t threshold = static_cast<uint8_t>( round( parameters.activity / scaler ) );
     oss << "Activity(" << parameters.activity << ")(" << to_string(threshold) << ") -> (" << to_string(threshold_activity) << ")" << endl;
@@ -383,7 +393,6 @@ int Cadxl345::autosleep( adxl345_payload::sleep_t parameters )
         return( _err );
 
     bitset<32> masking( parameters.masking );
-
     bool ac = masking[31] ? true : false;
     uint8_t csr = (( ac ? 1 : 0 ) << 3 )|(( ac ? 1 : 0 ) << 7 );
 
@@ -745,7 +754,8 @@ uint8_t Cadxl345::receive( Cadxl345Config::Numerology index )
             ADXL345_THRESH_INACT,
             ADXL345_WINDOW_INACT,
             ADXL345_INT_ENABLE,
-            ADXL345_INT_MAP };
+            ADXL345_INT_MAP,
+            ADXL345_POWER_CTL };
         for( const auto & r: autosleep_registers)
         {
             receive( r );

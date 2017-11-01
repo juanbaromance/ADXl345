@@ -207,7 +207,7 @@ protected:
     uint8_t dev_signature, rate_power_mode, int_source, data_format;
     uint8_t lsb_x, msb_x, lsb_y, msb_y, lsb_z, msb_z;
     uint8_t irq_enable, irq_map;
-    uint8_t autosleep_control, threshold_activity, threshold_inactivity, window_inactivity;
+    uint8_t autosleep_control, threshold_activity, threshold_inactivity, window_inactivity, power_csr;
     float scaling;
 
     typedef string (*register_decoder_t)(uint16_t);
