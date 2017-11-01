@@ -78,7 +78,7 @@ public:
 	ADXL345_WINDOW          = 0x23 ,// R/W Tap window.
 	ADXL345_THRESH_ACT      = 0x24 ,// R/W Activity threshold.
 	ADXL345_THRESH_INACT    = 0x25 ,// R/W Inactivity threshold.
-	ADXL345_TIME_INACT      = 0x26 ,// R/W Inactivity time.
+	ADXL345_WINDOW_INACT    = 0x26 ,// R/W Inactivity time.
 	ADXL345_ACT_INACT_CTL   = 0x27 ,// R/W Axis enable control for activity and inactivity detection.
 	ADXL345_THRESH_FF       = 0x28 ,// R/W Free-fall threshold.
 	ADXL345_TIME_FF         = 0x29 ,// R/W Free-fall time.

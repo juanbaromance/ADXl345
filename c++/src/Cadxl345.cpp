@@ -104,7 +104,7 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_ACT_INACT_CTL ] = register_spec_t( & autosleep_control   , "AutoSleep control" , 0 );
     registers[ ADXL345_THRESH_ACT    ] = register_spec_t( & threshold_activity  , "Activity(mg)" , 0 );
     registers[ ADXL345_THRESH_INACT  ] = register_spec_t( & threshold_inactivity, "Inactivity(mg)" , 0 );
-    registers[ ADXL345_TIME_INACT    ] = register_spec_t( & window_inactivity   , "Rest(sec)" , 0 );
+    registers[ ADXL345_WINDOW_INACT  ] = register_spec_t( & window_inactivity   , "Rest(sec)" , 0 );
     registers[ ADXL345_INT_ENABLE    ] = register_spec_t( & irq_enable          , "irq control" , 0 );
     registers[ ADXL345_INT_MAP       ] = register_spec_t( & irq_map             , "irq mapping" , 0 );
 
@@ -377,6 +377,24 @@ int Cadxl345::autosleep( adxl345_payload::sleep_t parameters )
     if( xmitt( ADXL345_THRESH_INACT, threshold ) < 0 )
         return( _err );
 
+    threshold = static_cast<uint8_t>( round( parameters.msec / 1000 ) );
+    oss << "InActivity.Window(" << parameters.msec << ")(" << to_string(threshold) << ") -> (" << to_string(window_inactivity) << ")" << endl;
+    if( xmitt( ADXL345_WINDOW_INACT, threshold ) < 0 )
+        return( _err );
+
+    bitset<32> masking( parameters.masking );
+
+    bool ac = masking[31] ? true : false;
+    uint8_t csr = (( ac ? 1 : 0 ) << 3 )|(( ac ? 1 : 0 ) << 7 );
+
+    bitset<3> operation(masking.to_ulong() & 0x3 );
+    csr |= ( operation[X] << 2 )|( operation[X] << 6 );
+    csr |= ( operation[Y] << 1 )|( operation[Y] << 5 );
+    csr |= ( operation[Z] << 0 )|( operation[Z] << 4 );
+
+    oss << "ASleep.ctrl(" << hex << csr << ") -> (" << hex << autosleep_control << ")" << endl;
+    if( xmitt( ADXL345_ACT_INACT_CTL, threshold ) < 0 )
+        return( _err );
 }
 
 int Cadxl345::xmitt( uint8_t r_index, uint8_t val )
@@ -725,7 +743,7 @@ uint8_t Cadxl345::receive( Cadxl345Config::Numerology index )
             ADXL345_ACT_INACT_CTL,
             ADXL345_THRESH_ACT,
             ADXL345_THRESH_INACT,
-            ADXL345_TIME_INACT,
+            ADXL345_WINDOW_INACT,
             ADXL345_INT_ENABLE,
             ADXL345_INT_MAP };
         for( const auto & r: autosleep_registers)
