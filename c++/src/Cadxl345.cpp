@@ -82,6 +82,8 @@ public:
 
 
 Cadxl345 *Cadxl345::ghost;
+
+
 Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     CiicDevice( 0x53 | ( iic_address & 0xf ) ),
     Cadxl345Config( config_spec )
@@ -91,7 +93,7 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_DEVID       ] = register_spec_t( & dev_signature  , "Signature", 0 );
 
     registers[ ADXL345_BW_RATE     ] = register_spec_t( & rate_power_mode, "Rate-PowerMode", 0 );
-    registers[ ADXL345_INT_SOURCE  ] = register_spec_t( & int_source     , "Interrupt source", 0 );
+    registers[ ADXL345_INT_SOURCE  ] = register_spec_t( & int_source     , "int source", 0 );
 
     registers[ ADXL345_DATAX0      ] = register_spec_t( & lsb_x, "Xlow"  , 0 );
     registers[ ADXL345_DATAX1      ] = register_spec_t( & msb_x, "Xhigh" , 0 );
@@ -101,13 +103,14 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_DATAZ1      ] = register_spec_t( & msb_z, "Zhigh" , 0 );
     registers[ ADXL345_DATA_FORMAT ] = register_spec_t( & data_format, "DataFormat" , 0 );
 
-    registers[ ADXL345_ACT_INACT_CTL ] = register_spec_t( & autosleep_control   , "AutoSleep control" , 0 );
-    registers[ ADXL345_THRESH_ACT    ] = register_spec_t( & threshold_activity  , "Activity(mg)" , 0 );
-    registers[ ADXL345_THRESH_INACT  ] = register_spec_t( & threshold_inactivity, "Inactivity(mg)" , 0 );
-    registers[ ADXL345_WINDOW_INACT  ] = register_spec_t( & window_inactivity   , "Rest(sec)" , 0 );
-    registers[ ADXL345_INT_ENABLE    ] = register_spec_t( & irq_enable          , "irq control" , 0 );
-    registers[ ADXL345_INT_MAP       ] = register_spec_t( & irq_map             , "irq mapping" , 0 );
-    registers[ ADXL345_POWER_CTL       ] = register_spec_t( & power_csr            ,"power-control", 0 );
+    registers[ ADXL345_ACT_INACT_CTL  ] = register_spec_t( & autosleep_control   , "AutoSleep control" , 0 );
+    registers[ ADXL345_THRESH_ACT     ] = register_spec_t( & threshold_activity  , "Activity(mg)" , 0 );
+    registers[ ADXL345_THRESH_INACT   ] = register_spec_t( & threshold_inactivity, "Inactivity(mg)" , 0 );
+    registers[ ADXL345_WINDOW_INACT   ] = register_spec_t( & window_inactivity   , "Rest(sec)" , 0 );
+    registers[ ADXL345_INT_ENABLE     ] = register_spec_t( & int_enable          , "int enable" , 0 );
+    registers[ ADXL345_INT_MAP        ] = register_spec_t( & int_map             , "int mapping" , 0 );
+    registers[ ADXL345_POWER_CTL      ] = register_spec_t( & power_ctrl            ,"Power Control", 0 );
+    registers[ ADXL345_ACT_TAP_STATUS ] = register_spec_t( & tap_status, "tap-status", 0 );
 
     scaling = ADXL345_SCALE_FACTOR;
     offset_buffer = { CStatistic("Xoff"), CStatistic("Yoff"), CStatistic("Zoff") };
@@ -121,6 +124,10 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     autoprobing = false;
 
     int elapsed = 0;
+
+    /* Features not exposed on runtime */
+    init_chipset();
+    alias = 0;
 
     {
 #if __cplusplus==201103L
@@ -146,6 +153,12 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     }
 
     string tmp = ( dev_signature == ADXL345_MAGIC ) ? " :: supported" : "";
+    if( dev_signature ^ ADXL345_MAGIC )
+    {
+        operation_log( "Chipset detection :: f a i l u r e", CiicDevice::Warning );
+        return;
+    }
+
     cout << "Actual chipset(0x" << hex << CChipsetConfig::_bus_address << ") state(" << _err << ")" << tmp + "(" + to_string(elapsed) + ")usec" << endl
          << report().c_str() << endl;
 
@@ -154,6 +167,41 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     profile_specification[ SLEEP_SPEC       ] = new SleepSettings();
 
     t = new std::thread( & Cadxl345::monitor, this );
+}
+
+
+void Cadxl345::init_chipset()
+{
+    // Interrupts mapping for the AutoSleep states
+    {
+        bitset<8> tmp(int_map);
+        /* Int2 pin */
+        tmp.set( Activity_IEbit );
+        tmp.set( InActivity_IEbit );
+
+        /* Int1 pin */
+        tmp.reset( DoubleTap_IEbit );
+        tmp.reset( SingleTap_IEbit );
+        tmp.reset( FreeFalling_IEbit );
+        xmitt( ADXL345_INT_MAP, static_cast<uint8_t>( tmp.to_ulong() ));
+    }
+
+    // Interrupts Enabled for AutoSleep states
+    {
+        bitset<8> tmp(int_enable);
+        tmp = 0;
+        tmp.set(Activity_IEbit);
+        //   tmp.set(InActivity_IEbit);
+        int_enable = static_cast<uint8_t>(tmp.to_ulong());
+        xmitt( ADXL345_INT_ENABLE, static_cast<uint8_t>( tmp.to_ulong() ) );
+    }
+
+    // AutoSleep mode is disabled by default
+    {
+        adxl345_payload::sleep_t parameters;
+        parameters.enable = false;
+        autosleep(parameters);
+    }
 }
 
 vector<float> Cadxl345::state()
@@ -178,7 +226,7 @@ vector<float> Cadxl345::state()
             tmp[ X ] *= scaling * GtoMsec2;
             tmp[ Y ] *= scaling * GtoMsec2;
             tmp[ Z ] *= scaling * GtoMsec2;
-            int i;
+            int i = 0;
             for( auto & acc : tmp )
             {
                 CalibDataT *c = & calibration[ i++ ];
@@ -211,8 +259,11 @@ string Cadxl345::report(Numerology mux)
             tie( r_val, r_name, ignore ) = r.second;
             oss << setfill(' ') << setw(25) << r_name
                 << " register( $"
-                << setw(3) << setfill('0') << hex << r.first  << ") :: $"
-                << setw(3) << setfill('0') << hex << bitset<8>(*r_val).to_ulong() << endl;
+                << setw(2) << setfill('0') << hex << r.first  << ") :: $"
+                << setw(2) << setfill('0') << hex << bitset<8>(*r_val).to_ulong() << " :: "
+                << setw(3) << setfill('0') << dec << bitset<8>(*r_val).to_ulong() << " :: "
+                << bitset<8>(*r_val)
+                << endl;
         }
     }
     else if ( mux == ADXL345_GEOMETRY )
@@ -222,20 +273,77 @@ string Cadxl345::report(Numerology mux)
                 ( _trace_level > -2  ) ? CiicDevice::Informer : CiicDevice::Silent;
         oss << typeid(this).name();
 
-        if( raw_acquistition == false )
+        if( bitset<8>(alias)[ASYNCHRONOUS_OPERATION_bit] == 0 )
         {
-            oss << " g(x,y,z,pitch,roll) :: ";
-            for( const auto & sample : _state.v )
-                oss << setw(10) << std::fixed << std::right << sample << " ";
+            if( raw_acquistition == false )
+            {
+                oss << " g(x,y,z,pitch,roll) :: ";
+                for( const auto & sample : _state.v )
+                    oss << setw(10) << std::fixed << std::right << sample << " ";
+            }
+            else
+            {
+                oss << " counts(x,y,z) :: " ;
+                for( auto const & p : _state.r )
+                    oss << p << " ";
+            }
         }
         else
         {
-            oss << " counts(x,y,z) :: " << _state.x << " " << _state.y << " " << _state.z;
+            oss << " mg(x,y,z) :: " ;
+            for( auto const & p : _state.r )
+                oss << p << " ";
         }
         operation_log( oss.str(), report );
 
     }
     return( CChipsetConfig::report() + oss.str() );
+}
+
+int Cadxl345::irq_handler(int elapsed )
+{
+    uint8_t tap_state = tap_status;
+    uint8_t xor_val = receive( ADXL345_ACT_TAP_STATUS ) ^ tap_state;
+    if( xor_val )
+    {
+        std::ostringstream oss;
+        receive( ADXL345_INT_SOURCE );
+        uint8_t mask = ( ( 1 << XActivity_TSbit )|( 1 << YActivity_TSbit )|(1 << ZActivity_TSbit ));
+        oss << setw(20) << "Activity( b" << bitset<8>(xor_val) << " ) versus ( b"<< bitset<8>(mask) << " ) ";
+
+        if( xor_val & mask & tap_status )
+        {
+
+            receive( ADXL345_POWER_CTL );
+            bitset<8> tmp( power_ctrl );
+            std::unique_lock<std::mutex>(ip_mtx);
+            profile.payload.tap.masking = tap_status;
+            profile.payload.tap.masking |= ( tmp[ SLEEP_MODE_POWER_CSR_bit ] << 8 );
+
+            oss << "PowerCtrl( b" << tmp << " )( b" << bitset<8>( profile.payload.tap.masking ) << " )";
+            operation_log( oss.str(), CiicDevice::Informer );
+            if( tmp[ SLEEP_MODE_POWER_CSR_bit ] )
+                sleep( false );
+            profile.operation_mask = 1 << TAP_SPEC;
+            int err_id;
+            if( ( err_id = sync_peer() ) < 0 )
+            {
+                std::ostringstream oss;
+                oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+                operation_log( oss.str(), CiicDevice::Warning );
+            }
+        }
+        else
+            operation_log( oss.str(), CiicDevice::Informer );
+    }
+
+    uint8_t int_state = int_source;
+    xor_val =  receive( ADXL345_INT_SOURCE ) ^ int_state;
+    if( xor_val )
+    {
+
+    }
+    return( 0 );
 }
 
 void Cadxl345::monitor()
@@ -245,6 +353,7 @@ void Cadxl345::monitor()
         oss << typeid(this).name() << "." << __FUNCTION__ << " :: running device sampling :: " + to_string(sampling) + "(msec)";
         operation_log( oss.str(), CiicDevice::Informer );
     }
+
 
     int elapsed = 0;
     while( 1 )
@@ -261,14 +370,14 @@ void Cadxl345::monitor()
 
         }
 
+        if( bitset<8>(alias)[ASYNCHRONOUS_OPERATION_bit] )
+            irq_handler(elapsed);
+
         if( state().size() )
         {
-
-
             if( sr[ connection ] == 0 )
             {
                 if( ! ( elapsed % 1000 ) )
-
                     report(ADXL345_GEOMETRY);
             }
         }
@@ -328,7 +437,6 @@ Cadxl345Config::dataRate_t Cadxl345::rate( Cadxl345Config::dataRate_t probe )
 
 
 /* POWER_CTL Bits */
-#define PCTL_LINK	    (1 << 5)
 #define PCTL_AUTO_SLEEP (1 << 4)
 #define PCTL_MEASURE	(1 << 3)
 #define PCTL_SLEEP	    (1 << 2)
@@ -341,12 +449,10 @@ int Cadxl345::sleep( bool val )
     if( _err != ADXL345_NO_ERR )
         return( _err );
 
-    vector <uint8_t> payload(2);
-
     if( val )
     {
-        tmp &= ~(PCTL_LINK | PCTL_MEASURE );
-        tmp |= (PCTL_AUTO_SLEEP|PCTL_SLEEP);
+        tmp |= (PCTL_MEASURE );
+        tmp |= (PCTL_SLEEP);
     }
     else
     {
@@ -358,52 +464,71 @@ int Cadxl345::sleep( bool val )
 
     xmitt( ADXL345_POWER_CTL, tmp );
     rate( Cadxl345Config::rate );
+
+    std::ostringstream oss;
+    oss << typeid(ghost).name() << ".operation # "
+        << ( val ? "disabled" : "e n a b l e d" )
+        << " # Power.ctrl( " << bitset<8>(tmp) << ")(" << bitset<8>(alias) << ")"
+        << endl << endl;
+    operation_log(oss.str(), Informer );
     return( _err );
 }
 
 int Cadxl345::autosleep( adxl345_payload::sleep_t parameters )
 {
     std::ostringstream oss;
-    oss << typeid(ghost).name() << ".autosleep # " << endl;
     receive( ADXL345_AUTOSLEEP );
+    oss << typeid(ghost).name() << ".autosleep # "
+        << ( parameters.enable ? "e n a b l e d" : "disabled" )
+        << " # Power.ctrl( " << bitset<8>(power_ctrl) << ")"
+        << endl;
 
-
-    power_csr &= ~( 1 << 4 );
-    power_csr |=  ( parameters.enable ? 1 : 0 ) << 4;
+    power_ctrl &= ~( 1 << ASLEEP_ENABLE_POWER_CSR_bit );
+    power_ctrl &= ~( 1 << ASLEEP_LINK_POWER_CSR_bit   );
+    xmitt( ADXL345_POWER_CTL, power_ctrl );
     if( parameters.enable == false )
     {
-        if( xmitt( ADXL345_POWER_CTL, power_csr ) < 0 )
+        operation_log(oss.str(), Informer );
         return( _err );
     }
 
-    float scaler = 31.2;
+    alias = power_ctrl | ( 1 << ASYNCHRONOUS_OPERATION_bit );
+    float scaler = ADXL345_THRESHOLD_FACTOR;
     uint8_t threshold = static_cast<uint8_t>( round( parameters.activity / scaler ) );
-    oss << "Activity(" << parameters.activity << ")(" << to_string(threshold) << ") -> (" << to_string(threshold_activity) << ")" << endl;
+    oss << setw(15) << "Activity("  << setw(5) << parameters.activity << ")(" << to_string(threshold) << ") -> (" << to_string(threshold_activity) << ")" << endl;
     if( xmitt( ADXL345_THRESH_ACT, threshold) < 0 )
         return( _err );
 
     threshold = static_cast<uint8_t>( round( parameters.inactivity / scaler ) );
-    oss << "InActivity(" << parameters.inactivity << ")(" << to_string(threshold) << ") -> (" << to_string(threshold_inactivity) << ")" << endl;
+    oss << setw(15) << "InActivity(" << setw(5) << parameters.inactivity << ")(" << to_string(threshold) << ") -> (" << to_string(threshold_inactivity) << ")" << endl;
     if( xmitt( ADXL345_THRESH_INACT, threshold ) < 0 )
         return( _err );
 
     threshold = static_cast<uint8_t>( round( parameters.msec / 1000 ) );
-    oss << "InActivity.Window(" << parameters.msec << ")(" << to_string(threshold) << ") -> (" << to_string(window_inactivity) << ")" << endl;
+    oss << setw(15) << "TimeWindow("  << setw(5) << parameters.msec << ")(" << to_string(threshold) << ") -> (" << to_string(window_inactivity) << ")" << endl;
     if( xmitt( ADXL345_WINDOW_INACT, threshold ) < 0 )
         return( _err );
 
     bitset<32> masking( parameters.masking );
-    bool ac = masking[31] ? true : false;
-    uint8_t csr = (( ac ? 1 : 0 ) << 3 )|(( ac ? 1 : 0 ) << 7 );
+    bitset<3> operation(masking.to_ulong() & 0x7 );
 
-    bitset<3> operation(masking.to_ulong() & 0x3 );
+    int relative = ( masking[31] || operation[Z] ) ? 1 : 0;
+    uint8_t csr = ( relative << 3 )|( relative << 7 );
     csr |= ( operation[X] << 2 )|( operation[X] << 6 );
     csr |= ( operation[Y] << 1 )|( operation[Y] << 5 );
     csr |= ( operation[Z] << 0 )|( operation[Z] << 4 );
-
-    oss << "ASleep.ctrl(" << hex << csr << ") -> (" << hex << autosleep_control << ")" << endl;
-    if( xmitt( ADXL345_ACT_INACT_CTL, threshold ) < 0 )
+    oss << setw(15) << "Activity.ctrl(0x" << hex << ADXL345_ACT_INACT_CTL << ")(" << bitset<8>(csr) << ") -> (" << bitset<8>(autosleep_control) << ")" << endl;
+    if( xmitt( ADXL345_ACT_INACT_CTL, csr ) < 0 )
         return( _err );
+
+//    oss << setw(15) << "Power.ctrl("  << bitset<8>(power_ctrl) << ")" << endl;
+//    power_ctrl &= ( ~ ( 0x3 ) );
+//    power_ctrl |= 1 << ASLEEP_LINK_POWER_CSR_bit;
+//    power_ctrl |= 1 << ASLEEP_ENABLE_POWER_CSR_bit;
+//    xmitt( ADXL345_POWER_CTL, power_ctrl );
+    operation_log( oss.str(), Informer );
+
+
 }
 
 int Cadxl345::xmitt( uint8_t r_index, uint8_t val )
@@ -828,10 +953,11 @@ void Cadxl345::ip_callback(socket_header_t *header, void *payload)
     case __KILL_CONNECTION_id:
     {
         sr.reset( connection );
+        alias = 0;
         std::ostringstream oss;
         oss << typeid(this).name() + string(" # peer relase s a m p l e d");
         operation_log( oss.str(), CiicDevice::Informer );
-     }
+    }
         break;
 
     case __FULL_DUPLEX_COMPLETED_id:

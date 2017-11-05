@@ -20,9 +20,12 @@ using namespace std;
 using namespace ADXL345IPNameSpace;
 
 #define ADXL345_SCALE_FACTOR    0.00195
+#define ADXL345_THRESHOLD_FACTOR 31.2
 
 typedef struct StateT {
     vector <float> v = vector <float>(5);
+    vector <int>   r = vector <int>(3);
+
     float x, y, z, pitch, roll;
     StateT(){ operator()( 0, 0, 0); }
 
@@ -31,6 +34,11 @@ typedef struct StateT {
 	v[ X     ] = x =  _x;
 	v[ Y     ] = y =  _y;
 	v[ Z     ] = z =  _z;
+
+	r[ X     ] = static_cast<int>(x*1000);
+	r[ Y     ] = static_cast<int>(y*1000);
+	r[ Z     ] = static_cast<int>(z*1000);
+
 	v[ Pitch ] = pitch = atan2(x,  sqrt(y*y+z*z)) * 180.0 / M_PI;
 	v[ Roll  ] = roll  = atan2(y,  sqrt(x*x+z*z)) * 180.0 / M_PI;
     }
@@ -115,6 +123,21 @@ public:
 	FreeFallPin1 = 0,
 	FreeFallPin2 = 1,
 	FreeFallNoPin = 2,
+
+	/* Significative Bits */
+	ASYNCHRONOUS_OPERATION_bit = 7, // software mapped (virtualised)
+	SLEEP_MODE_POWER_CSR_bit = 2,
+	ASLEEP_ENABLE_POWER_CSR_bit = 4,
+	ASLEEP_LINK_POWER_CSR_bit = 5,
+	Activity_IEbit   = 4,
+	InActivity_IEbit = 3,
+	DoubleTap_IEbit = 2,
+	SingleTap_IEbit = 6,
+	FreeFalling_IEbit = 5,
+
+	XActivity_TSbit = 6,
+	YActivity_TSbit = 5,
+	ZActivity_TSbit = 4,
 
 	ADXL345_NO_ERR = 0,
 	ERR_ADXL345_PAYLOAD_OOSYNC = -1,
@@ -206,8 +229,8 @@ protected:
 
     uint8_t dev_signature, rate_power_mode, int_source, data_format;
     uint8_t lsb_x, msb_x, lsb_y, msb_y, lsb_z, msb_z;
-    uint8_t irq_enable, irq_map;
-    uint8_t autosleep_control, threshold_activity, threshold_inactivity, window_inactivity, power_csr;
+    uint8_t int_enable, int_map;
+    uint8_t autosleep_control, threshold_activity, threshold_inactivity, window_inactivity, power_ctrl, tap_status, alias;
     float scaling;
 
     typedef string (*register_decoder_t)(uint16_t);
@@ -229,6 +252,8 @@ protected:
 
     static Cadxl345 *ghost;
 
+    void init_chipset();
+    int  irq_handler(int elapsed);
 };
 
 
