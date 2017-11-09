@@ -9,14 +9,31 @@
 #include "adxl345/Cadxl345.h"
 #include "common/raspberry_iface.h"
 #include "common/CNetworkSlot.h"
+#include "common/CStatistic.h"
 #include <stdint.h>
 #include <cmath>
+#include <list>
+#include <algorithm>
+#include <mutex>
+#include <condition_variable>
+
 #if __cplusplus==201103L
                 typedef std::chrono::high_resolution_clock Clock;
                 typedef std::chrono::microseconds MyTimeUnits;
 #endif
 
 using namespace std;
+
+
+static std::mutex              mtx;
+static std::condition_variable cv;
+
+template<class T>
+bool check_range(T value, T min, T max)
+{
+    return (value >= min) && (value <= max);
+}
+
 
 Cadxl345Config::Cadxl345Config(string file_spec) : CChipsetConfig( file_spec )
 {
@@ -33,7 +50,50 @@ int Cadxl345Config::sync_configuration()
 
 }
 
+
+class TapSettings : public Activity {
+public:
+    void resolver( void *payload )
+    {
+        ADXL345ProfileT *profile_data = (ADXL345ProfileT *)payload;
+        if( bitset<32>(profile_data->payload.tap.masking)[31] )
+            Cadxl345::freefall_specs( profile_data->payload.tap.threshold, profile_data->payload.tap.msec_window );
+        else
+            Cadxl345::tapping( profile_data->payload.tap );
+    }
+};
+
+class AcquisitionSettings : public Activity {
+public:
+    void resolver( void *payload )
+    {
+        ADXL345ProfileT *profile_data = (ADXL345ProfileT *)payload;
+        Cadxl345::settings( profile_data->payload.acquisition );
+    }
+};
+
+class SleepSettings : public Activity {
+public:
+    void resolver( void *payload )
+    {
+        ADXL345ProfileT *tmp = ( ADXL345ProfileT* )payload;
+        Cadxl345::sleep( tmp->payload.sleep );
+    }
+};
+
+class SelfTesting: public Activity {
+public:
+    void resolver( void *payload )
+    {
+        ADXL345ProfileT *tmp = ( ADXL345ProfileT* )payload;
+        Cadxl345::autoprobe( tmp->payload.enable );
+    }
+};
+
+
 Cadxl345 *Cadxl345::ghost;
+
+
 Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     CiicDevice( 0x53 | ( iic_address & 0xf ) ),
     Cadxl345Config( config_spec )
@@ -43,7 +103,7 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_DEVID       ] = register_spec_t( & dev_signature  , "Signature", 0 );
 
     registers[ ADXL345_BW_RATE     ] = register_spec_t( & rate_power_mode, "Rate-PowerMode", 0 );
-    registers[ ADXL345_INT_SOURCE  ] = register_spec_t( & int_source     , "Interrupt source", 0 );
+    registers[ ADXL345_INT_SOURCE  ] = register_spec_t( & int_source     , "int source", 0 );
 
     registers[ ADXL345_DATAX0      ] = register_spec_t( & lsb_x, "Xlow"  , 0 );
     registers[ ADXL345_DATAX1      ] = register_spec_t( & msb_x, "Xhigh" , 0 );
@@ -52,12 +112,34 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_DATAZ0      ] = register_spec_t( & lsb_z, "Zlow"  , 0 );
     registers[ ADXL345_DATAZ1      ] = register_spec_t( & msb_z, "Zhigh" , 0 );
     registers[ ADXL345_DATA_FORMAT ] = register_spec_t( & data_format, "DataFormat" , 0 );
+
+    registers[ ADXL345_ACT_INACT_CTL  ] = register_spec_t( & autosleep_control   , "AutoSleep control" , 0 );
+    registers[ ADXL345_THRESH_ACT     ] = register_spec_t( & threshold_activity  , "Activity(mg)" , 0 );
+    registers[ ADXL345_THRESH_INACT   ] = register_spec_t( & threshold_inactivity, "Inactivity(mg)" , 0 );
+    registers[ ADXL345_WINDOW_INACT   ] = register_spec_t( & window_inactivity   , "Rest(sec)" , 0 );
+    registers[ ADXL345_INT_ENABLE     ] = register_spec_t( & int_enable          , "int enable" , 0 );
+    registers[ ADXL345_INT_MAP        ] = register_spec_t( & int_map             , "int mapping" , 0 );
+    registers[ ADXL345_POWER_CTL      ] = register_spec_t( & power_ctrl            ,"Power Control", 0 );
+    registers[ ADXL345_ACT_TAP_STATUS ] = register_spec_t( & tap_status, "tap-status", 0 );
+    registers[ ADXL345_TIME_FF        ] = register_spec_t( & freefall.window, "FreeFall-window", 0 );
+    registers[ ADXL345_THRESH_FF      ] = register_spec_t( & freefall.threshold, "FreeFall-threshold", 0 );
+
+    scaling = ADXL345_SCALE_FACTOR;
+    offset_buffer = { CStatistic("Xoff"), CStatistic("Yoff"), CStatistic("Zoff") };
+
+    /* see page 22 of 36 Table-16 8g.10bit case of use */
+    self_test = { range_t(12,148),range_t(-148,-12), range_t(19,232) };
+
     active_range = 2;
     sampling = 100;
-
-
+    raw_acquistition = false;
+    autoprobing = false;
 
     int elapsed = 0;
+
+    /* Features not exposed on runtime */
+    init_chipset();
+    alias = 0;
 
     {
 #if __cplusplus==201103L
@@ -83,11 +165,62 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     }
 
     string tmp = ( dev_signature == ADXL345_MAGIC ) ? " :: supported" : "";
+    if( dev_signature ^ ADXL345_MAGIC )
+    {
+        operation_log( "Chipset detection :: f a i l u r e", CiicDevice::Warning );
+        return;
+    }
+
     cout << "Actual chipset(0x" << hex << CChipsetConfig::_bus_address << ") state(" << _err << ")" << tmp + "(" + to_string(elapsed) + ")usec" << endl
          << report().c_str() << endl;
 
-    profile_specification[ ACQUISITION_SPEC ] =  new AcquisitionSettings();
+    /* TCP/IP interface */
+    profile_specification[ ACQUISITION_SPEC ] = new AcquisitionSettings();
+    profile_specification[ SELF_TESTING     ] = new SelfTesting();
+    profile_specification[ SLEEP_SPEC       ] = new SleepSettings();
+    profile_specification[ TAP_SPEC         ] = new TapSettings();
+
     t = new std::thread( & Cadxl345::monitor, this );
+}
+
+
+void Cadxl345::init_chipset()
+{
+    // Interrupts mapping for the AutoSleep states
+    {
+        bitset<8> tmp(int_map);
+        /* Int2 pin */
+        tmp.set( Activity_IEbit );
+        tmp.set( InActivity_IEbit );
+
+        /* Int1 pin */
+        tmp.reset( DoubleTap_IEbit );
+        tmp.reset( SingleTap_IEbit );
+        tmp.reset( FreeFalling_IEbit );
+        xmitt( ADXL345_INT_MAP, static_cast<uint8_t>( tmp.to_ulong() ));
+    }
+
+    // Interrupts Enabled for AutoSleep states
+    {
+        bitset<8> tmp(int_enable);
+        tmp = 0;
+        tmp.set( DoubleTap_IEbit );
+        tmp.set( SingleTap_IEbit );
+        tmp.set( FreeFalling_IEbit );
+        int_enable = static_cast<uint8_t>(tmp.to_ulong());
+        xmitt( ADXL345_INT_ENABLE, static_cast<uint8_t>( tmp.to_ulong() ) );
+    }
+
+    // AutoSleep mode is disabled by default
+    {
+        adxl345_payload::sleep_t parameters;
+        parameters.enable = false;
+        autosleep(parameters);
+    }
+
+    /* initialise freefall stuff with default parameters 30msec/500mg */
+    freefall_specs();
+    tapping();
 }
 
 vector<float> Cadxl345::state()
@@ -98,21 +231,34 @@ vector<float> Cadxl345::state()
     receive( ADXL345_XYZ );
     if( _err == ADXL345_NO_ERR  )
     {
-        float scaling = ADXL345_SCALE_FACTOR;
+
         scaling = full_resolver ? scaling : ( scaling * ( active_range >> 1 ) );
 //        printf("$%02x%02x:%02x%02x:%02x%02x(%4.4f)( $%08x ) :: ",
 //               msb_x, lsb_x, msb_y, lsb_y, msb_z, lsb_z, scaling, data_format  );
 
-        tmp[0] = ( c2ToDec( ( static_cast<short>(msb_x) << 8) + lsb_x, 16 ) * scaling * GtoMsec2);
-        tmp[1] = ( c2ToDec( ( static_cast<short>(msb_y) << 8) + lsb_y, 16 ) * scaling * GtoMsec2);
-        tmp[2] = ( c2ToDec( ( static_cast<short>(msb_z) << 8) + lsb_z, 16 ) * scaling * GtoMsec2);
+        tmp[ X ] = c2ToDec( ( static_cast<short>(msb_x) << 8) + lsb_x, 16 );
+        tmp[ Y ] = c2ToDec( ( static_cast<short>(msb_y) << 8) + lsb_y, 16 );
+        tmp[ Z ] = c2ToDec( ( static_cast<short>(msb_z) << 8) + lsb_z, 16 );
 
-        int i;
-        for( auto & acc : tmp )
+        if( raw_acquistition == false )
         {
-            CalibDataT *c = & calibration[ i++ ];
-            acc = acc * c->slope + c->offset;
+            tmp[ X ] *= scaling * GtoMsec2;
+            tmp[ Y ] *= scaling * GtoMsec2;
+            tmp[ Z ] *= scaling * GtoMsec2;
+            int i = 0;
+            for( auto & acc : tmp )
+            {
+                CalibDataT *c = & calibration[ i++ ];
+                acc = acc * c->slope + c->offset;
+            }
         }
+        else
+        {
+            std::ostringstream oss;
+            oss << " counts(x,y,z) :: " << setw( 4 ) << tmp[X] << " "  << setw( 4 ) << tmp[ Y ] << " "  << setw( 4 ) << tmp[ Z ];
+            operation_log( oss.str(),( _trace_level > -2  ) ? CiicDevice::Informer : CiicDevice::Silent );
+        }
+
         _state( tmp[ X ], tmp[ Y ], tmp[ Z ] );
 
     }
@@ -132,8 +278,11 @@ string Cadxl345::report(Numerology mux)
             tie( r_val, r_name, ignore ) = r.second;
             oss << setfill(' ') << setw(25) << r_name
                 << " register( $"
-                << setw(3) << setfill('0') << hex << r.first  << ") :: $"
-                << setw(3) << setfill('0') << hex << bitset<8>(*r_val).to_ulong() << endl;
+                << setw(2) << setfill('0') << hex << r.first  << ") :: $"
+                << setw(2) << setfill('0') << hex << bitset<8>(*r_val).to_ulong() << " :: "
+                << setw(3) << setfill('0') << dec << bitset<8>(*r_val).to_ulong() << " :: "
+                << bitset<8>(*r_val)
+                << endl;
         }
     }
     else if ( mux == ADXL345_GEOMETRY )
@@ -141,56 +290,191 @@ string Cadxl345::report(Numerology mux)
 
         CiicDevice::TraceLevelEnum report =
                 ( _trace_level > -2  ) ? CiicDevice::Informer : CiicDevice::Silent;
-        oss << typeid(this).name() <<  " g(x,y,z,pitch,roll) :: ";
-        for( const auto & sample : _state.v )
-            oss << setw(10) << std::fixed << std::right << sample << " ";
+        oss << typeid(this).name();
+
+        if( bitset<8>(alias)[ASYNCHRONOUS_OPERATION_bit] == 0 )
+        {
+            if( raw_acquistition == false )
+            {
+                oss << " g(x,y,z,pitch,roll) :: ";
+                for( const auto & sample : _state.v )
+                    oss << setw(10) << std::fixed << std::right << sample << " ";
+            }
+            else
+            {
+                oss << " counts(x,y,z) :: " ;
+                for( auto const & p : _state.r )
+                    oss << p << " ";
+            }
+        }
+        else
+        {
+            oss << " mg(x,y,z) :: " ;
+            for( auto const & p : _state.r )
+                oss << p << " ";
+        }
         operation_log( oss.str(), report );
 
     }
     return( CChipsetConfig::report() + oss.str() );
 }
 
+void Cadxl345::irq_handler(int elapsed )
+{
+    uint8_t tap_state = tap_status;
+    uint8_t xor_val = receive( ADXL345_ACT_TAP_STATUS ) ^ tap_state;
+    uint8_t int_state = int_source;
+    if( xor_val )
+    {
+        receive( ADXL345_INT_SOURCE );
+
+        std::ostringstream oss;
+        uint8_t mask;
+
+        mask = ( ( 1 << XActivity_TSbit )|( 1 << YActivity_TSbit )|(1 << ZActivity_TSbit ));
+        oss << setw(20) << "Activity( b" << bitset<8>(xor_val) << " ) versus ( b"<< bitset<8>(mask) << " ) ";
+        oss << endl;
+        oss << setw(20) << " tap-status( b" << bitset<8>(tap_status)<< " ) ";
+        oss << setw(20) << " int_source( b" << bitset<8>(int_source)<< " ) ";
+        uint8_t activity_event = xor_val & mask & tap_status;
+        if( activity_event )
+        {
+            bitset<8> tmp( receive( ADXL345_POWER_CTL ) );
+            if( tmp[ SLEEP_MODE_POWER_CSR_bit ] )
+                sleep( false );
+            {
+                std::unique_lock<std::mutex>(ip_mtx);
+                profile.payload.tap.masking = tap_status;
+                profile.payload.tap.masking |= ( tmp[ SLEEP_MODE_POWER_CSR_bit ] << 8 );
+                profile.payload.tap.masking |= 1 << 31;
+                oss << "PowerCtrl( b" << tmp << " )( b" << bitset<8>( profile.payload.tap.masking ) << " )";
+                operation_log( oss.str(), CiicDevice::Informer );
+                profile.operation_mask = 1 << TAP_SPEC;
+                int err_id;
+                if( ( err_id = sync_peer() ) < 0 )
+                {
+                    std::ostringstream oss;
+                    oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+                    operation_log( oss.str(), CiicDevice::Warning );
+                }
+            }
+        }
+
+        mask = FullTapping;
+        uint8_t tap_event =  xor_val & mask & tap_status;
+        if( tap_event )
+        {
+            {
+                std::unique_lock<std::mutex>(ip_mtx);
+                profile.payload.tap.masking = bitset<3>(tap_event).to_ulong();
+                profile.payload.tap.masking |= int_source << 8;
+                if( int_source & TapIntMasking )
+                    profile.payload.tap.masking |=
+                            1 << ( bitset<8>(int_source)[ SingleTap_IEbit ] ? 30 : 29 );
+                profile.operation_mask = 1 << TAP_SPEC;
+                int err_id;
+                if( ( err_id = sync_peer() ) < 0 )
+                {
+                    std::ostringstream oss;
+                    oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+                    operation_log( oss.str(), CiicDevice::Warning );
+                }
+            }
+
+            std::ostringstream oss;
+            oss << typeid(this).name() <<  "." + string(__FUNCTION__) << endl;
+            oss << setw(20) << " tap_event   ( b" << bitset<3>(tap_event)  << " ) " << endl;
+            oss << setw(20) << " int_source  ( b" << bitset<8>(int_source) << " ) " << endl;
+            oss << setw(20) << " tap_masking ( b" << bitset<32>(profile.payload.tap.masking) << " )" << endl;
+            operation_log( oss.str(), CiicDevice::Informer );
+        }
+    }
+    else
+      receive( ADXL345_INT_SOURCE );
+
+    xor_val =  int_source ^ int_state;
+    if( xor_val )
+    {
+        std::ostringstream oss;
+        if( bitset<8>(xor_val)[ FreeFalling_IEbit ] )
+        {
+            oss << typeid(this).name() <<  ".freefall : s a m p l e d";
+            std::unique_lock<std::mutex>(ip_mtx);
+            profile.payload.tap.masking = 1 << 28;
+            profile.operation_mask = 1 << TAP_SPEC;
+            int err_id;
+            if( ( err_id = sync_peer() ) < 0 )
+            {
+                std::ostringstream oss;
+                oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+                operation_log( oss.str(), CiicDevice::Warning );
+            }
+        }
+        operation_log( oss.str(), CiicDevice::Informer );
+    }
+    return;
+}
+
 void Cadxl345::monitor()
 {
     {
         std::ostringstream oss;
-        oss << typeid(this).name() <<  __FUNCTION__ << "running device sampling :: " + to_string(sampling) + "(msec)";
+        oss << typeid(this).name() << "." << __FUNCTION__ << " :: running device sampling :: " + to_string(sampling) + "(msec)";
         operation_log( oss.str(), CiicDevice::Informer );
     }
 
+
+    int elapsed = 0;
     while( 1 )
     {
         int err_id;
         std::this_thread::sleep_for(std::chrono::milliseconds( sampling ));
+        elapsed += sampling;
 
+        if( autoprobing == true )
+        {
+            std::unique_lock<std::mutex>(mtx);
+            cv.notify_one();
+            continue;
+
+        }
+
+        irq_handler(elapsed);
 
         if( state().size() )
         {
-            profile.payload.accelerometer.x     = _state.x;
-            profile.payload.accelerometer.y     = _state.y;
-            profile.payload.accelerometer.z     = _state.z;
-            profile.payload.accelerometer.pitch = _state.pitch;
-            profile.payload.accelerometer.roll  = _state.roll;
-            report(ADXL345_GEOMETRY);
+            if( sr[ connection ] == 0 )
+            {
+                if( ! ( elapsed % 1000 ) )
+                    report(ADXL345_GEOMETRY);
+            }
         }
 
         if( sr[ connection ] == 0 )
             continue;
 
-        bitset<32> mask;
-        mask.set(ACCELEROMETER_STATE);
-        profile.operation_mask = mask.to_ulong();
-        if( ( err_id = sync_peer() ) < 0 )
         {
-            std::ostringstream oss;
-            oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
-            operation_log( oss.str(), CiicDevice::Warning );
-            continue;
+            std::unique_lock<std::mutex>(ip_mtx);
+            profile.payload.accelerometer.x     = _state.x;
+            profile.payload.accelerometer.y     = _state.y;
+            profile.payload.accelerometer.z     = _state.z;
+            profile.payload.accelerometer.pitch = _state.pitch;
+            profile.payload.accelerometer.roll  = _state.roll;
+            bitset<32> mask;
+            mask.set(ACCELEROMETER_STATE);
+            profile.operation_mask = mask.to_ulong();
+            if( ( err_id = sync_peer() ) < 0 )
+            {
+                std::ostringstream oss;
+                oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+                operation_log( oss.str(), CiicDevice::Warning );
+            }
         }
 
     }
 
 }
+
 
 string Cadxl345::err(int index)
 {
@@ -213,20 +497,14 @@ Cadxl345Config::dataRate_t Cadxl345::rate( Cadxl345Config::dataRate_t probe )
     uint8_t tmp = receive(ADXL345_BW_RATE);
     if( _err != ADXL345_NO_ERR )
         return( Cadxl345Config::rate );
-
-    vector <uint8_t> payload(2);
     tmp &= 0x10;
     tmp |= probe;
-    payload[0] = ADXL345_BW_RATE ;
-    payload[1] = tmp;
-    xmitt( payload );
-
+    xmitt( ADXL345_BW_RATE, tmp );
     return( Cadxl345Config::rate = static_cast<Cadxl345Config::dataRate_t>( receive(ADXL345_BW_RATE) ) );
 }
 
 
 /* POWER_CTL Bits */
-#define PCTL_LINK	    (1 << 5)
 #define PCTL_AUTO_SLEEP (1 << 4)
 #define PCTL_MEASURE	(1 << 3)
 #define PCTL_SLEEP	    (1 << 2)
@@ -234,32 +512,275 @@ Cadxl345Config::dataRate_t Cadxl345::rate( Cadxl345Config::dataRate_t probe )
 
 int Cadxl345::sleep( bool val )
 {
-    uint8_t tmp = receive( ADXL345_POWER_CTL );
+    Numerology r = ADXL345_POWER_CTL;
+    uint8_t tmp = receive( r);
     if( _err != ADXL345_NO_ERR )
         return( _err );
 
     if( val )
     {
-        tmp &= ~(PCTL_AUTO_SLEEP | PCTL_LINK);
+        tmp |= (PCTL_MEASURE );
+        tmp |= (PCTL_SLEEP);
     }
     else
-        tmp |=  PCTL_AUTO_SLEEP | PCTL_LINK;
-    tmp |= PCTL_MEASURE * ( val ? 0 : 1 );
-    vector <uint8_t> payload(2);
-    payload[0] = ADXL345_POWER_CTL;
-    payload[1] = tmp;
-    xmitt( payload );
+    {
+        tmp &= ~(PCTL_SLEEP|PCTL_AUTO_SLEEP|PCTL_MEASURE);
+        xmitt( ADXL345_POWER_CTL, tmp );
+        wait(1000);
+        tmp |= PCTL_MEASURE;
+    }
 
+    xmitt( ADXL345_POWER_CTL, tmp );
     rate( Cadxl345Config::rate );
 
-
+    std::ostringstream oss;
+    oss << typeid(ghost).name() << ".operation # "
+        << ( val ? "disabled" : "e n a b l e d" )
+        << " # Power.ctrl( " << bitset<8>(tmp) << ")(" << bitset<8>(alias) << ")"
+        << endl << endl;
+    operation_log(oss.str(), Informer );
     return( _err );
 }
 
+int Cadxl345::autosleep( adxl345_payload::sleep_t parameters )
+{
+    std::ostringstream oss;
+    receive( ADXL345_AUTOSLEEP );
+    oss << typeid(ghost).name() << ".autosleep # "
+        << ( parameters.enable ? "e n a b l e d" : "disabled" )
+        << " # Power.ctrl( " << bitset<8>(power_ctrl) << ")"
+        << endl;
 
-int Cadxl345::tapping( Numerology mode, bitset<3> mask, int msec_duration , int msec_latency, int threshold, Numerology int_mapping )
+    power_ctrl &= ~( 1 << ASLEEP_ENABLE_POWER_CSR_bit );
+    power_ctrl &= ~( 1 << ASLEEP_LINK_POWER_CSR_bit   );
+    xmitt( ADXL345_POWER_CTL, power_ctrl );
+    if( parameters.enable == false )
+    {
+        operation_log(oss.str(), Informer );
+        return( _err );
+    }
+
+    alias = power_ctrl | ( 1 << ASYNCHRONOUS_OPERATION_bit );
+    float scaler = ADXL345_THRESHOLD_FACTOR;
+    uint8_t threshold = static_cast<uint8_t>( round( parameters.activity / scaler ) );
+    oss << setw(15) << "Activity("  << setw(5) << parameters.activity << ")(" << to_string(threshold) << ") -> (" << to_string(threshold_activity) << ")" << endl;
+    if( xmitt( ADXL345_THRESH_ACT, threshold) < 0 )
+        return( _err );
+
+    threshold = static_cast<uint8_t>( round( parameters.inactivity / scaler ) );
+    oss << setw(15) << "InActivity(" << setw(5) << parameters.inactivity << ")(" << to_string(threshold) << ") -> (" << to_string(threshold_inactivity) << ")" << endl;
+    if( xmitt( ADXL345_THRESH_INACT, threshold ) < 0 )
+        return( _err );
+
+    threshold = static_cast<uint8_t>( round( parameters.msec / 1000 ) );
+    oss << setw(15) << "TimeWindow("  << setw(5) << parameters.msec << ")(" << to_string(threshold) << ") -> (" << to_string(window_inactivity) << ")" << endl;
+    if( xmitt( ADXL345_WINDOW_INACT, threshold ) < 0 )
+        return( _err );
+
+    bitset<32> masking( parameters.masking );
+    bitset<3> operation(masking.to_ulong() & 0x7 );
+
+    int relative = ( masking[31] || operation[Z] ) ? 1 : 0;
+    uint8_t csr = ( relative << 3 )|( relative << 7 );
+    csr |= ( operation[X] << 2 )|( operation[X] << 6 );
+    csr |= ( operation[Y] << 1 )|( operation[Y] << 5 );
+    csr |= ( operation[Z] << 0 )|( operation[Z] << 4 );
+    oss << setw(15) << "Activity.ctrl(0x" << hex << ADXL345_ACT_INACT_CTL << ")(" << bitset<8>(csr) << ") -> (" << bitset<8>(autosleep_control) << ")" << endl;
+    if( xmitt( ADXL345_ACT_INACT_CTL, csr ) < 0 )
+        return( _err );
+
+    receive( ADXL345_INT_ENABLE);
+    bitset<8> tmp(int_enable);
+    tmp.set(Activity_IEbit);
+    tmp.set(InActivity_IEbit);
+    xmitt( ADXL345_INT_ENABLE, static_cast<uint8_t>( tmp.to_ulong() ) );
+
+//    oss << setw(15) << "Power.ctrl("  << bitset<8>(power_ctrl) << ")" << endl;
+//    power_ctrl &= ( ~ ( 0x3 ) );
+//    power_ctrl |= 1 << ASLEEP_LINK_POWER_CSR_bit;
+//    power_ctrl |= 1 << ASLEEP_ENABLE_POWER_CSR_bit;
+//    xmitt( ADXL345_POWER_CTL, power_ctrl );
+    operation_log( oss.str(), Informer );
+
+
+}
+
+int Cadxl345::xmitt( uint8_t r_index, uint8_t val )
+{
+    vector <uint8_t> payload(2);
+    payload[0] = r_index ;
+    payload[1] = val;
+    return( _err = ( CiicDevice::xmitt( payload ) < 0 ) ? ERR_ADXL345_XMITT_BUS_ERR : ADXL345_NO_ERR );
+}
+
+int Cadxl345::tapping(bitset<3> mask, int msec_duration , int msec_latency, int msec_window, int threshold )
+{
+    bitset<8> tmp( receive( ADXL345_TAP_AXES ) );
+    tmp &= ~0x7;
+    tmp |= ( mask.to_ulong() & 0x7 );
+    tmp.set(3);
+    xmitt( ADXL345_TAP_AXES, static_cast<uint8_t>( tmp.to_ulong() ) );
+    xmitt( ADXL345_DUR   , static_cast<uint8_t>( msec_duration * 1000 / 625.  ) );
+    xmitt( ADXL345_LATENT, static_cast<uint8_t>( msec_latency / 1.25 ) );
+    xmitt( ADXL345_WINDOW, static_cast<uint8_t>( msec_window * 1000 / 1.25  ) );
+    xmitt( ADXL345_THRESH_TAP, static_cast<uint8_t>( threshold / ADXL345_THRESHOLD_FACTOR ));
+
+    return( 0 );
+
+
+}
+
+void Cadxl345::sleep( adxl345_payload::sleep_t tmp )
+{
+    if( tmp.automatic )
+    {
+        ghost->autosleep( tmp );
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << typeid(ghost).name() <<  ".sleep : " << ( tmp.enable ? "entering" : "exit" );
+    operation_log(oss.str(), Informer );
+    ghost->sleep( tmp.enable );
+}
+
+void Cadxl345::autoprobe( Cadxl345Config::Numerology phase )
 {
 
+    buffer.clear();
+    std::unique_lock<std::mutex> locker(mtx);
+    cv.wait(locker);
+    locker.unlock();
+
+    const int snapshot = 10000, deadline = 200000;
+    {
+        std::ostringstream oss;
+        oss << typeid(this).name() + string(".autoprobe(10bits) :: data taking for ") + to_string( deadline / 1000 ) << "msec";
+        operation_log( oss.str(), Informer );
+        int elapsed = 0;
+        do
+        {
+            buffer.push_back( ghost->state() );
+            wait( snapshot);
+        }while( ( elapsed += snapshot ) < deadline );
+    }
+
+    if( phase == AUTOPROBE_OFFSET )
+    {
+        for( auto & s : offset_buffer )
+            s = s.clear();
+
+        int i = 0;
+        for( const auto & b : buffer )
+            for( const auto & sample : b )
+                offset_buffer[ ( i++ ) % 3 ].update( sample );
+
+        std::ostringstream oss;
+        oss << typeid(this).name() + string(" :: - Offset - statistics mean/noise/max/min(") + to_string( buffer.size()) << ")" << endl ;
+        for( auto & o : offset_buffer )
+            oss << o.report( ) << endl;
+        operation_log( oss.str(), Informer );
+        return;
+    }
+
+    if( phase == AUTOPROBE_LOAD )
+    {
+        vector <CStatistic> load = { CStatistic("Xload"), CStatistic("Yload"), CStatistic("Zload") };
+        {
+            int i = 0;
+            for( const auto & b : buffer )
+                for( const auto & sample : b )
+                    load[ ( i++ ) % 3 ].update( sample );
+        }
+
+        int pass_masking = 0;
+        vector <int> residual;
+        vector <bool> pass;
+        vector <adxl345_numerics> v = { X, Y, Z };
+        for( const auto & i : v )
+        {
+            residual.push_back( static_cast<int>( round( load[i].mean - offset_buffer[i].mean ) ) );
+            int min,max;
+            tie(min,max) = self_test[i];
+            pass.push_back( check_range(residual[i],min,max) );
+            pass_masking |= ( check_range(residual[i],min,max) ? 1 : 0 ) << i;
+        }
+
+        {
+            std::ostringstream oss;
+            oss << typeid(this).name() + string(" :: -  Load  - statistics mean/noise/max/min(") + to_string( buffer.size()) << ")" << endl ;
+            {
+                int i = 0;
+                for( auto & o : load )
+                    oss << o.report( ) << " residual(" << setprecision(3) << setw(7) << residual[ i ] << ")" << ( pass[ i++ ] ? " passed " : " checkme please" ) << endl;
+            }
+            operation_log( oss.str(), Informer );
+        }
+
+        autoprobe( autoprobing = false );
+
+        {
+            std::unique_lock<std::mutex>(ip_mtx);
+            profile.payload.self_test.mask = pass_masking;
+            profile.payload.self_test.offset_x = offset_buffer[X].mean;
+            profile.payload.self_test.offset_y = offset_buffer[Y].mean;
+            profile.payload.self_test.offset_z = offset_buffer[Z].mean;
+            profile.payload.self_test.x = residual[X];
+            profile.payload.self_test.y = residual[Y];
+            profile.payload.self_test.z = residual[Z];
+            bitset<32> mask;
+            mask.set(SELF_TESTING);
+            profile.operation_mask = mask.to_ulong();
+            int err_id;
+            if( ( err_id = sync_peer() ) < 0 )
+            {
+                std::ostringstream oss;
+                oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+                operation_log( oss.str(), CiicDevice::Warning );
+            }
+            operation_log( typeid(this).name() + string("peer forwarded with autoprobe results"), Informer );
+        }
+        return;
+    }
+
+}
+
+
+void Cadxl345::autoprobe( bool enable )
+{
+
+    ghost->raw_acquistition= enable;
+    ghost->autoprobing = enable;
+    if( enable )
+        ghost->autoprobe( AUTOPROBE_OFFSET );
+
+    cv.notify_all();
+
+    Numerology r = ADXL345_DATA_FORMAT;
+    enum {
+        FullResolutionBit = 3,
+        SelfTestingBit = 7
+    };
+
+    uint8_t tmp = ghost->receive( r );
+    tmp &= ~( 1 << SelfTestingBit );
+    tmp &= ~( 1 << FullResolutionBit );
+    tmp |= ( enable ? 1 : 0 ) << SelfTestingBit;
+    tmp |= ( enable ? 0 : 1 ) << FullResolutionBit;
+    ghost->xmitt( r, tmp );
+
+    std::ostringstream oss;
+    oss << typeid(ghost).name() + string(".autoprobe(10bits) :: ") << ( enable ? "toggled" : "untoggled" );
+    operation_log( oss.str(), Informer );
+
+    if( enable )
+        ghost->autoprobe( AUTOPROBE_LOAD );
+
+}
+
+void Cadxl345::tapping(adxl345_payload::tap_t tmp)
+{
+    ghost->tapping( bitset<3>(tmp.masking), tmp.msec_window, tmp.msec_window >> 16, tmp.threshold );
 }
 
 void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
@@ -304,61 +825,28 @@ void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
 
 }
 
-int Cadxl345::freefall(float mg_threshold, int msec_window, Cadxl345Config::Numerology pin )
+
+void Cadxl345::freefall_specs( float mg_threshold, int msec_window )
 {
-    vector <uint8_t> payload;
-    payload.push_back( ADXL345_THRESH_FF );
-    payload.push_back( static_cast<int>( mg_threshold / 62.5) );
-    if( xmitt( payload ) < 0 )
-        return( _err );
-
-    payload.clear();
-    payload.push_back( ADXL345_THRESH_FF );
-    payload.push_back( static_cast<int>( msec_window / 5.0 ) );
-    if( xmitt( payload ) < 0 )
-        return( _err );
-
-    uint8_t aux, tmp = receive( ADXL345_INT_MAP );
-    aux = tmp & ( ~( 1 << 2 ) );
-    bool int_enabled = false;
-    if( ( pin == FreeFallPin1 ) || ( pin == FreeFallPin2 ) )
-    {
-        aux |= ( pin << 2 );
-        payload.clear();
-        payload.push_back( ADXL345_INT_MAP );
-        payload.push_back( aux);
-        if( xmitt( payload ) < 0 )
-            return( _err );
-        int_enabled = true;
-    }
-
-    tmp = receive( ADXL345_INT_ENABLE );
-    aux = tmp & ( ~( 1 << 2 ) );
-    aux |= ( int_enabled ? 1 : 0 ) << 2;
-    payload.clear();
-    payload.push_back( ADXL345_INT_ENABLE );
-    payload.push_back( aux );
-    xmitt( payload ) ;
-    return( _err );
+    if(  ghost->xmitt( ADXL345_THRESH_FF, static_cast<uint8_t>( mg_threshold / ADXL345_THRESHOLD_FACTOR ) ) < 0 )
+        return;
+    if(  ghost->xmitt( ADXL345_TIME_FF, static_cast<uint8_t>( msec_window / 5.0 ) ) < 0 )
+        return;
+    ghost->alias |= ( 1 << ASYNCHRONOUS_OPERATION_bit );
+    return;
 
 }
 
-int Cadxl345::offset(const vector<int> *offset )
+int Cadxl345::offset(const vector<int> *payload )
 {
-    if( offset->size() < 3 )
+    if( payload->size() < 3 )
         return ( _err = ERR_OFFSET_OOSPEC );
 
-    vector <uint8_t> payload(2);
     int i = 0;
-    for( const auto & val : *offset )
-    {
-        float tmp = val / 15.6;
-        payload[0] = ADXL345_CALIBRATION_OFFSET + i;
-        payload[1] = DecToc2( static_cast<int>( round( tmp ) ) );
-        if( xmitt( payload ) < 0 )
+    for( const auto & val : *payload )
+        if(  xmitt( ADXL345_CALIBRATION_OFFSET + ( i++ ), DecToc2( static_cast<int>( round(  val / 15.6 ) ) ) ) < 0 )
             break;
-        i++;
-    }
+
     return( _err );
 
 }
@@ -366,10 +854,10 @@ int Cadxl345::offset(const vector<int> *offset )
 int Cadxl345::range( Numerology probe_range, bool full_resolution )
 {
     static map <Numerology,uint8_t> ranges = {
-        { PlusMinus2G , 0},
-        { PlusMinus4G , 1},
-        { PlusMinus8G , 2},
-        { PlusMinus16G, 3},
+        { PlusMinus1G , 0},
+        { PlusMinus2G , 1},
+        { PlusMinus4G , 2},
+        { PlusMinus8G , 3},
     };
 
     if( ranges.find( probe_range ) == ranges.end() )
@@ -385,10 +873,7 @@ int Cadxl345::range( Numerology probe_range, bool full_resolution )
 
     r_val  = data_format & ( ~( 0x3 | ( 1 << 3 ) ) );
     r_val |= range | ( ( full_resolution ? 1 : 0 ) << 3 );
-    vector< uint8_t> payload;
-    payload.push_back( ADXL345_DATA_FORMAT );
-    payload.push_back( r_val );
-    if( xmitt( payload ) == 0 )
+    if(  xmitt( ADXL345_DATA_FORMAT, r_val ) == 0 )
     {
         active_range = ( 1 << ( range + 1 ) );
         full_resolver = full_resolution;
@@ -421,10 +906,11 @@ uint8_t Cadxl345::DecToc2( int val )
 }
 
 
-uint8_t Cadxl345::receive( Cadxl345Config::Numerology offset )
+uint8_t Cadxl345::receive( Cadxl345Config::Numerology index )
 {
 
-    if( offset == ADXL345_CHIPSET )
+    /* artefacts ------------------------------------------------------------ */
+    if( index == ADXL345_CHIPSET )
     {
          uint8_t tmp = -1;
          for( const auto & r: registers )
@@ -432,11 +918,11 @@ uint8_t Cadxl345::receive( Cadxl345Config::Numerology offset )
          return( tmp );
     }
 
-    if( offset == ADXL345_XYZ )
+    if( index == ADXL345_XYZ )
     {
         uint8_t tmp = -1;
         vector< uint8_t> register_address = { ADXL345_DATAX0 };
-         if( xmitt( register_address ) == 0 )
+        if(  CiicDevice::xmitt( register_address ) == 0 )
          {
              vector< uint8_t> raw_data = CiicDevice::receive( 6 );
              if( raw_data.size() == 6 )
@@ -455,13 +941,34 @@ uint8_t Cadxl345::receive( Cadxl345Config::Numerology offset )
          return( tmp );
     }
 
+    if( index ==  ADXL345_AUTOSLEEP )
+    {
+        uint8_t tmp = -1;
+        static list <Numerology> autosleep_registers = {
+            ADXL345_ACT_INACT_CTL,
+            ADXL345_THRESH_ACT,
+            ADXL345_THRESH_INACT,
+            ADXL345_WINDOW_INACT,
+            ADXL345_INT_ENABLE,
+            ADXL345_INT_MAP,
+            ADXL345_POWER_CTL };
+        for( const auto & r: autosleep_registers)
+        {
+            receive( r );
+            if( _err != ADXL345_NO_ERR )
+                break;
+        }
+        return( tmp );
+    }
+    /* ---------------------------------------------------------------------- */
+
     uint8_t tmp = -1;
     uint8_t *ptr = & tmp;
-    if( registers.find( offset ) != registers.end() )
-        tie( ptr, ignore, ignore ) = registers.find( offset )->second;
+    if( registers.find( index ) != registers.end() )
+        tie( ptr, ignore, ignore ) = registers.find( index )->second;
 
-    vector< uint8_t> register_address = { static_cast<uint8_t>( offset & 0xff ) };
-    if( xmitt( register_address ) == 0 )
+    vector< uint8_t> register_address = { static_cast<uint8_t>( index & 0xff ) };
+    if(  CiicDevice::xmitt( register_address ) == 0 )
     {
         vector <uint8_t> probe = CiicDevice::receive();
         if( probe.size() )
@@ -517,10 +1024,11 @@ void Cadxl345::ip_callback(socket_header_t *header, void *payload)
     case __KILL_CONNECTION_id:
     {
         sr.reset( connection );
+        alias = 0;
         std::ostringstream oss;
         oss << typeid(this).name() + string(" # peer relase s a m p l e d");
         operation_log( oss.str(), CiicDevice::Informer );
-     }
+    }
         break;
 
     case __FULL_DUPLEX_COMPLETED_id:
@@ -535,11 +1043,6 @@ void Cadxl345::ip_callback(socket_header_t *header, void *payload)
 
 }
 
-void AcquisitionSettings::resolver( void *payload )
-{
-   ADXL345ProfileT *profile_data = (ADXL345ProfileT *)payload;
-   Cadxl345::settings( profile_data->payload.acquisition );
-}
 
 
 
