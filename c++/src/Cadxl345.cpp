@@ -51,7 +51,17 @@ int Cadxl345Config::sync_configuration()
 }
 
 
-
+class TapSettings : public Activity {
+public:
+    void resolver( void *payload )
+    {
+        ADXL345ProfileT *profile_data = (ADXL345ProfileT *)payload;
+        if( bitset<32>(profile_data->payload.tap.masking)[31] )
+            Cadxl345::freefall_specs( profile_data->payload.tap.threshold, profile_data->payload.tap.msec_window );
+        else
+            Cadxl345::tapping( profile_data->payload.tap );
+    }
+};
 
 class AcquisitionSettings : public Activity {
 public:
@@ -111,6 +121,8 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     registers[ ADXL345_INT_MAP        ] = register_spec_t( & int_map             , "int mapping" , 0 );
     registers[ ADXL345_POWER_CTL      ] = register_spec_t( & power_ctrl            ,"Power Control", 0 );
     registers[ ADXL345_ACT_TAP_STATUS ] = register_spec_t( & tap_status, "tap-status", 0 );
+    registers[ ADXL345_TIME_FF        ] = register_spec_t( & freefall.window, "FreeFall-window", 0 );
+    registers[ ADXL345_THRESH_FF      ] = register_spec_t( & freefall.threshold, "FreeFall-threshold", 0 );
 
     scaling = ADXL345_SCALE_FACTOR;
     offset_buffer = { CStatistic("Xoff"), CStatistic("Yoff"), CStatistic("Zoff") };
@@ -162,9 +174,11 @@ Cadxl345::Cadxl345(int iic_address, string name, string config_spec) :
     cout << "Actual chipset(0x" << hex << CChipsetConfig::_bus_address << ") state(" << _err << ")" << tmp + "(" + to_string(elapsed) + ")usec" << endl
          << report().c_str() << endl;
 
+    /* TCP/IP interface */
     profile_specification[ ACQUISITION_SPEC ] = new AcquisitionSettings();
     profile_specification[ SELF_TESTING     ] = new SelfTesting();
     profile_specification[ SLEEP_SPEC       ] = new SleepSettings();
+    profile_specification[ TAP_SPEC         ] = new TapSettings();
 
     t = new std::thread( & Cadxl345::monitor, this );
 }
@@ -190,8 +204,9 @@ void Cadxl345::init_chipset()
     {
         bitset<8> tmp(int_enable);
         tmp = 0;
-        tmp.set(Activity_IEbit);
-        //   tmp.set(InActivity_IEbit);
+        tmp.set( DoubleTap_IEbit );
+        tmp.set( SingleTap_IEbit );
+        tmp.set( FreeFalling_IEbit );
         int_enable = static_cast<uint8_t>(tmp.to_ulong());
         xmitt( ADXL345_INT_ENABLE, static_cast<uint8_t>( tmp.to_ulong() ) );
     }
@@ -202,6 +217,10 @@ void Cadxl345::init_chipset()
         parameters.enable = false;
         autosleep(parameters);
     }
+
+    /* initialise freefall stuff with default parameters 30msec/500mg */
+    freefall_specs();
+    tapping();
 }
 
 vector<float> Cadxl345::state()
@@ -300,30 +319,88 @@ string Cadxl345::report(Numerology mux)
     return( CChipsetConfig::report() + oss.str() );
 }
 
-int Cadxl345::irq_handler(int elapsed )
+void Cadxl345::irq_handler(int elapsed )
 {
     uint8_t tap_state = tap_status;
     uint8_t xor_val = receive( ADXL345_ACT_TAP_STATUS ) ^ tap_state;
+    uint8_t int_state = int_source;
+    if( xor_val )
+    {
+        receive( ADXL345_INT_SOURCE );
+
+        std::ostringstream oss;
+        uint8_t mask;
+
+        mask = ( ( 1 << XActivity_TSbit )|( 1 << YActivity_TSbit )|(1 << ZActivity_TSbit ));
+        oss << setw(20) << "Activity( b" << bitset<8>(xor_val) << " ) versus ( b"<< bitset<8>(mask) << " ) ";
+        oss << endl;
+        oss << setw(20) << " tap-status( b" << bitset<8>(tap_status)<< " ) ";
+        oss << setw(20) << " int_source( b" << bitset<8>(int_source)<< " ) ";
+        uint8_t activity_event = xor_val & mask & tap_status;
+        if( activity_event )
+        {
+            bitset<8> tmp( receive( ADXL345_POWER_CTL ) );
+            if( tmp[ SLEEP_MODE_POWER_CSR_bit ] )
+                sleep( false );
+            {
+                std::unique_lock<std::mutex>(ip_mtx);
+                profile.payload.tap.masking = tap_status;
+                profile.payload.tap.masking |= ( tmp[ SLEEP_MODE_POWER_CSR_bit ] << 8 );
+                profile.payload.tap.masking |= 1 << 31;
+                oss << "PowerCtrl( b" << tmp << " )( b" << bitset<8>( profile.payload.tap.masking ) << " )";
+                operation_log( oss.str(), CiicDevice::Informer );
+                profile.operation_mask = 1 << TAP_SPEC;
+                int err_id;
+                if( ( err_id = sync_peer() ) < 0 )
+                {
+                    std::ostringstream oss;
+                    oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+                    operation_log( oss.str(), CiicDevice::Warning );
+                }
+            }
+        }
+
+        mask = FullTapping;
+        uint8_t tap_event =  xor_val & mask & tap_status;
+        if( tap_event )
+        {
+            {
+                std::unique_lock<std::mutex>(ip_mtx);
+                profile.payload.tap.masking = bitset<3>(tap_event).to_ulong();
+                profile.payload.tap.masking |= int_source << 8;
+                if( int_source & TapIntMasking )
+                    profile.payload.tap.masking |=
+                            1 << ( bitset<8>(int_source)[ SingleTap_IEbit ] ? 30 : 29 );
+                profile.operation_mask = 1 << TAP_SPEC;
+                int err_id;
+                if( ( err_id = sync_peer() ) < 0 )
+                {
+                    std::ostringstream oss;
+                    oss << typeid(this).name() <<  ".sync_peer : f a i l u r e d : err_id(" + to_string(err_id) + ")";
+                    operation_log( oss.str(), CiicDevice::Warning );
+                }
+            }
+
+            std::ostringstream oss;
+            oss << typeid(this).name() <<  "." + string(__FUNCTION__) << endl;
+            oss << setw(20) << " tap_event   ( b" << bitset<3>(tap_event)  << " ) " << endl;
+            oss << setw(20) << " int_source  ( b" << bitset<8>(int_source) << " ) " << endl;
+            oss << setw(20) << " tap_masking ( b" << bitset<32>(profile.payload.tap.masking) << " )" << endl;
+            operation_log( oss.str(), CiicDevice::Informer );
+        }
+    }
+    else
+      receive( ADXL345_INT_SOURCE );
+
+    xor_val =  int_source ^ int_state;
     if( xor_val )
     {
         std::ostringstream oss;
-        receive( ADXL345_INT_SOURCE );
-        uint8_t mask = ( ( 1 << XActivity_TSbit )|( 1 << YActivity_TSbit )|(1 << ZActivity_TSbit ));
-        oss << setw(20) << "Activity( b" << bitset<8>(xor_val) << " ) versus ( b"<< bitset<8>(mask) << " ) ";
-
-        if( xor_val & mask & tap_status )
+        if( bitset<8>(xor_val)[ FreeFalling_IEbit ] )
         {
-
-            receive( ADXL345_POWER_CTL );
-            bitset<8> tmp( power_ctrl );
+            oss << typeid(this).name() <<  ".freefall : s a m p l e d";
             std::unique_lock<std::mutex>(ip_mtx);
-            profile.payload.tap.masking = tap_status;
-            profile.payload.tap.masking |= ( tmp[ SLEEP_MODE_POWER_CSR_bit ] << 8 );
-
-            oss << "PowerCtrl( b" << tmp << " )( b" << bitset<8>( profile.payload.tap.masking ) << " )";
-            operation_log( oss.str(), CiicDevice::Informer );
-            if( tmp[ SLEEP_MODE_POWER_CSR_bit ] )
-                sleep( false );
+            profile.payload.tap.masking = 1 << 28;
             profile.operation_mask = 1 << TAP_SPEC;
             int err_id;
             if( ( err_id = sync_peer() ) < 0 )
@@ -333,17 +410,9 @@ int Cadxl345::irq_handler(int elapsed )
                 operation_log( oss.str(), CiicDevice::Warning );
             }
         }
-        else
-            operation_log( oss.str(), CiicDevice::Informer );
+        operation_log( oss.str(), CiicDevice::Informer );
     }
-
-    uint8_t int_state = int_source;
-    xor_val =  receive( ADXL345_INT_SOURCE ) ^ int_state;
-    if( xor_val )
-    {
-
-    }
-    return( 0 );
+    return;
 }
 
 void Cadxl345::monitor()
@@ -370,8 +439,7 @@ void Cadxl345::monitor()
 
         }
 
-        if( bitset<8>(alias)[ASYNCHRONOUS_OPERATION_bit] )
-            irq_handler(elapsed);
+        irq_handler(elapsed);
 
         if( state().size() )
         {
@@ -521,6 +589,12 @@ int Cadxl345::autosleep( adxl345_payload::sleep_t parameters )
     if( xmitt( ADXL345_ACT_INACT_CTL, csr ) < 0 )
         return( _err );
 
+    receive( ADXL345_INT_ENABLE);
+    bitset<8> tmp(int_enable);
+    tmp.set(Activity_IEbit);
+    tmp.set(InActivity_IEbit);
+    xmitt( ADXL345_INT_ENABLE, static_cast<uint8_t>( tmp.to_ulong() ) );
+
 //    oss << setw(15) << "Power.ctrl("  << bitset<8>(power_ctrl) << ")" << endl;
 //    power_ctrl &= ( ~ ( 0x3 ) );
 //    power_ctrl |= 1 << ASLEEP_LINK_POWER_CSR_bit;
@@ -539,8 +613,20 @@ int Cadxl345::xmitt( uint8_t r_index, uint8_t val )
     return( _err = ( CiicDevice::xmitt( payload ) < 0 ) ? ERR_ADXL345_XMITT_BUS_ERR : ADXL345_NO_ERR );
 }
 
-int Cadxl345::tapping( Numerology mode, bitset<3> mask, int msec_duration , int msec_latency, int threshold, Numerology int_mapping )
+int Cadxl345::tapping(bitset<3> mask, int msec_duration , int msec_latency, int msec_window, int threshold )
 {
+    bitset<8> tmp( receive( ADXL345_TAP_AXES ) );
+    tmp &= ~0x7;
+    tmp |= ( mask.to_ulong() & 0x7 );
+    tmp.set(3);
+    xmitt( ADXL345_TAP_AXES, static_cast<uint8_t>( tmp.to_ulong() ) );
+    xmitt( ADXL345_DUR   , static_cast<uint8_t>( msec_duration * 1000 / 625.  ) );
+    xmitt( ADXL345_LATENT, static_cast<uint8_t>( msec_latency / 1.25 ) );
+    xmitt( ADXL345_WINDOW, static_cast<uint8_t>( msec_window * 1000 / 1.25  ) );
+    xmitt( ADXL345_THRESH_TAP, static_cast<uint8_t>( threshold / ADXL345_THRESHOLD_FACTOR ));
+
+    return( 0 );
+
 
 }
 
@@ -694,7 +780,7 @@ void Cadxl345::autoprobe( bool enable )
 
 void Cadxl345::tapping(adxl345_payload::tap_t tmp)
 {
-
+    ghost->tapping( bitset<3>(tmp.masking), tmp.msec_window, tmp.msec_window >> 16, tmp.threshold );
 }
 
 void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
@@ -740,29 +826,14 @@ void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
 }
 
 
-int Cadxl345::freefall(float mg_threshold, int msec_window, Cadxl345Config::Numerology pin )
+void Cadxl345::freefall_specs( float mg_threshold, int msec_window )
 {
-
-    if(  xmitt( ADXL345_THRESH_FF, static_cast<uint8_t>( mg_threshold / 62.5) ) < 0 )
-        return( _err );
-    if(  xmitt( ADXL345_TIME_FF, static_cast<uint8_t>( msec_window / 5.0 ) ) < 0 )
-        return( _err );
-
-    uint8_t aux, tmp = receive( ADXL345_INT_MAP );
-    aux = tmp & ( ~( 1 << 2 ) );
-    bool int_enabled = false;
-    if( ( pin == FreeFallPin1 ) || ( pin == FreeFallPin2 ) )
-    {
-        aux |= ( pin << 2 );
-        if(  xmitt( ADXL345_INT_MAP , aux ) < 0 )
-            return( _err );
-        int_enabled = true;
-    }
-
-    tmp = receive( ADXL345_INT_ENABLE );
-    aux = tmp & ( ~( 1 << 2 ) );
-    aux |= ( int_enabled ? 1 : 0 ) << 2;
-    return( xmitt( ADXL345_INT_ENABLE , aux) );
+    if(  ghost->xmitt( ADXL345_THRESH_FF, static_cast<uint8_t>( mg_threshold / ADXL345_THRESHOLD_FACTOR ) ) < 0 )
+        return;
+    if(  ghost->xmitt( ADXL345_TIME_FF, static_cast<uint8_t>( msec_window / 5.0 ) ) < 0 )
+        return;
+    ghost->alias |= ( 1 << ASYNCHRONOUS_OPERATION_bit );
+    return;
 
 }
 

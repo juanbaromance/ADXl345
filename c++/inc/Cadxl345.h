@@ -129,16 +129,20 @@ public:
 	SLEEP_MODE_POWER_CSR_bit = 2,
 	ASLEEP_ENABLE_POWER_CSR_bit = 4,
 	ASLEEP_LINK_POWER_CSR_bit = 5,
-	Activity_IEbit   = 4,
-	InActivity_IEbit = 3,
-	DoubleTap_IEbit = 2,
-	SingleTap_IEbit = 6,
-	FreeFalling_IEbit = 5,
+	Activity_IEbit    = 4,
+	InActivity_IEbit  = 3,
+	DoubleTap_IEbit   = 5,
+	SingleTap_IEbit   = 6,
+	FreeFalling_IEbit = 2,
+	TapIntMasking = ( 1 << SingleTap_IEbit ) | ( 1 << DoubleTap_IEbit ),
 
 	XActivity_TSbit = 6,
 	YActivity_TSbit = 5,
 	ZActivity_TSbit = 4,
-
+	XTap_TSbit = 2,
+	YTap_TSbit = 1,
+	ZTap_TSbit = 0,
+	FullTapping = ( ( 1 << XTap_TSbit )|( 1 << YTap_TSbit )|(1 << ZTap_TSbit )),
 	ADXL345_NO_ERR = 0,
 	ERR_ADXL345_PAYLOAD_OOSYNC = -1,
 	ERR_ADXL345_XMITT_BUS_ERR = -2,
@@ -197,14 +201,15 @@ public:
     int range     ( Numerology probe_range, bool full_resolution );
     int sleep     ( bool val );
     int autosleep ( adxl345_payload::sleep_t parameters );
-    int freefall  ( float mg_threshold = 500, int msec_window = 200, Numerology pin = FreeFallPin1 );
-    int tapping   ( Numerology mode, bitset<3> mask, int msec_duration, int msec_latency, int threshold, Numerology int_mapping);
+
+    int tapping   (bitset<3> mask = FullTapping, int msec_duration = 20, int msec_latency = 20, int msec_window = 20, int threshold = 2500 );
 
 public:
     static void settings  ( adxl345_payload::acquisition_t tmp );
     static void sleep     ( adxl345_payload::sleep_t tmp );
     static void autoprobe ( bool enable );
     static void tapping   ( adxl345_payload::tap_t tmp );
+    static void freefall_specs  ( float mg_threshold = 750, int msec_window = 100 );
 
 protected:
     void monitor( );
@@ -222,6 +227,8 @@ protected:
     string err( int index = -1 );
     dataRate_t rate( dataRate_t probe );
     void ip_callback(socket_header_t *header, void *payload );
+    void init_chipset();
+    void irq_handler(int elapsed);
 
     int active_range, sampling;
     bool full_resolver, raw_acquistition, autoprobing;
@@ -232,6 +239,11 @@ protected:
     uint8_t int_enable, int_map;
     uint8_t autosleep_control, threshold_activity, threshold_inactivity, window_inactivity, power_ctrl, tap_status, alias;
     float scaling;
+
+    struct {
+	uint8_t window;
+	uint8_t threshold;
+    }freefall;
 
     typedef string (*register_decoder_t)(uint16_t);
     typedef tuple <  uint8_t*, string, register_decoder_t> register_spec_t;
@@ -252,8 +264,7 @@ protected:
 
     static Cadxl345 *ghost;
 
-    void init_chipset();
-    int  irq_handler(int elapsed);
+
 };
 
 
