@@ -201,8 +201,7 @@ public:
     int range     ( Numerology probe_range, bool full_resolution );
     int sleep     ( bool val );
     int autosleep ( adxl345_payload::sleep_t parameters );
-
-    int tapping   (bitset<3> mask = FullTapping, int msec_duration = 20, int msec_latency = 20, int msec_window = 20, int threshold = 2500 );
+    int tapping   ( bitset<3> mask = FullTapping, int msec_duration = 20, int msec_latency = 20, int msec_window = 20, int threshold = 2500 );
 
 public:
     static void settings  ( adxl345_payload::acquisition_t tmp );
@@ -210,6 +209,7 @@ public:
     static void autoprobe ( bool enable );
     static void tapping   ( adxl345_payload::tap_t tmp );
     static void freefall_specs  ( float mg_threshold = 750, int msec_window = 100 );
+    static void tapping_state( );
 
 protected:
     void monitor( );

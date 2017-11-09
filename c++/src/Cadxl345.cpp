@@ -56,10 +56,17 @@ public:
     void resolver( void *payload )
     {
         ADXL345ProfileT *profile_data = (ADXL345ProfileT *)payload;
-        if( bitset<32>(profile_data->payload.tap.masking)[31] )
-            Cadxl345::freefall_specs( profile_data->payload.tap.threshold, profile_data->payload.tap.msec_window );
-        else
+        bitset<32>operation(profile_data->payload.tap.masking);
+        if( operation[30] )
+        {
+            Cadxl345::tapping_state();
+            return;
+        }
+
+        if( operation[31])
             Cadxl345::tapping( profile_data->payload.tap );
+        else
+            Cadxl345::freefall_specs( profile_data->payload.tap.threshold, profile_data->payload.tap.msec_window );
     }
 };
 
@@ -780,7 +787,7 @@ void Cadxl345::autoprobe( bool enable )
 
 void Cadxl345::tapping(adxl345_payload::tap_t tmp)
 {
-    ghost->tapping( bitset<3>(tmp.masking), tmp.msec_window, tmp.msec_window >> 16, tmp.threshold );
+    ghost->tapping( bitset<3>(tmp.masking), tmp.duration, tmp.latency, tmp.msec_window, tmp.threshold );
 }
 
 void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
@@ -826,14 +833,32 @@ void Cadxl345::settings( adxl345_payload::acquisition_t tmp )
 }
 
 
-void Cadxl345::freefall_specs( float mg_threshold, int msec_window )
+void Cadxl345::freefall_specs( float threshold, int window )
 {
-    if(  ghost->xmitt( ADXL345_THRESH_FF, static_cast<uint8_t>( mg_threshold / ADXL345_THRESHOLD_FACTOR ) ) < 0 )
+    std::ostringstream oss;
+
+    oss << typeid(ghost).name() + string(".freefall-settings(mg/msec) :: ");
+    oss << static_cast<int>( ghost->freefall.threshold * ADXL345_THRESHOLD_FACTOR ) << "/";
+    oss << static_cast<int>( ghost->freefall.window * 5. );
+    oss << " -> " << threshold << "/" << window;
+    operation_log( oss.str(), CiicDevice::Informer );
+
+    ghost->freefall.threshold = static_cast<uint8_t>( round( threshold  / ADXL345_THRESHOLD_FACTOR ) );
+    ghost->freefall.window    = static_cast<uint8_t>( round( window / 5. ) );
+    if(  ghost->xmitt( ADXL345_THRESH_FF, ghost->freefall.threshold ) < 0 )
         return;
-    if(  ghost->xmitt( ADXL345_TIME_FF, static_cast<uint8_t>( msec_window / 5.0 ) ) < 0 )
+    if(  ghost->xmitt( ADXL345_TIME_FF, ghost->freefall.window ) < 0 )
         return;
     ghost->alias |= ( 1 << ASYNCHRONOUS_OPERATION_bit );
     return;
+
+}
+
+void Cadxl345::tapping_state()
+{
+    std::ostringstream oss;
+    oss << typeid(ghost).name() + string( __FUNCTION__ ) + string(".settings reply :: ");
+    operation_log( oss.str(), CiicDevice::Informer );
 
 }
 
