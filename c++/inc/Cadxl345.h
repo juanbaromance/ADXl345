@@ -21,12 +21,14 @@ using namespace ADXL345IPNameSpace;
 
 #define ADXL345_SCALE_FACTOR    0.00195
 #define ADXL345_THRESHOLD_FACTOR 31.2
+#define ADXL345_DURATION_FACTOR 625.0
+#define ADXL345_TAP_MSEC_FACTOR 1.25
 
 typedef struct StateT {
-    vector <float> v = vector <float>(5);
+    vector <float> v = vector <float>(6);
     vector <int>   r = vector <int>(3);
 
-    float x, y, z, pitch, roll;
+    float x, y, z, pitch, roll, yaw;
     StateT(){ operator()( 0, 0, 0); }
 
     void operator()( float _x, float _y, float _z )
@@ -41,6 +43,7 @@ typedef struct StateT {
 
 	v[ Pitch ] = pitch = atan2(x,  sqrt(y*y+z*z)) * 180.0 / M_PI;
 	v[ Roll  ] = roll  = atan2(y,  sqrt(x*x+z*z)) * 180.0 / M_PI;
+	v[ Yaw   ] = yaw   = atan2(sqrt(x*x+y*y),z  ) * 180.0 / M_PI;
     }
 }StateT;
 
@@ -112,6 +115,7 @@ public:
 	ADXL345_CHIPSET         = 0xff  ,// Full chipset
 	ADXL345_GEOMETRY        = 0x1ff ,
 	ADXL345_AUTOSLEEP       = 0x200 , // ACT_INACT_CTL, THRESH_ACT, THRESH_INACT, TIME_INACT, INT_ENABLE, INT_MAP
+	ADXL345_FREEFALLAndTAP  = 0x201 ,
 
 	/* Ranges */
 	PlusMinus1G  = 0b00,
@@ -143,6 +147,12 @@ public:
 	YTap_TSbit = 1,
 	ZTap_TSbit = 0,
 	FullTapping = ( ( 1 << XTap_TSbit )|( 1 << YTap_TSbit )|(1 << ZTap_TSbit )),
+
+	FreeFallStuff = 0,
+	TapStuff = 1,
+	LastReply,
+	FreeFallAndTapStuff = ( 1 << FreeFallStuff ) | ( 1 << TapStuff ),
+
 	ADXL345_NO_ERR = 0,
 	ERR_ADXL345_PAYLOAD_OOSYNC = -1,
 	ERR_ADXL345_XMITT_BUS_ERR = -2,
@@ -229,6 +239,7 @@ protected:
     void ip_callback(socket_header_t *header, void *payload );
     void init_chipset();
     void irq_handler(int elapsed);
+    void reply(int mask);
 
     int active_range, sampling;
     bool full_resolver, raw_acquistition, autoprobing;
@@ -241,9 +252,12 @@ protected:
     float scaling;
 
     struct {
-	uint8_t window;
-	uint8_t threshold;
+	uint8_t window, threshold;
     }freefall;
+
+    struct {
+	uint8_t duration, latency, window, threshold, mask;
+    }tap;
 
     typedef string (*register_decoder_t)(uint16_t);
     typedef tuple <  uint8_t*, string, register_decoder_t> register_spec_t;
@@ -263,6 +277,7 @@ protected:
     vector <CStatistic> offset_buffer;
 
     static Cadxl345 *ghost;
+
 
 
 };
