@@ -39,13 +39,6 @@ using namespace std;
 static std::mutex              mtx;
 static std::condition_variable cv;
 
-template<class T>
-bool check_range(T value, T min, T max)
-{
-    return (value >= min) && (value <= max);
-}
-
-
 Cadxl345Config::Cadxl345Config(string file_spec) : CChipsetConfig( file_spec )
 {
     rate = ADXL345_DATARATE_800_HZ;

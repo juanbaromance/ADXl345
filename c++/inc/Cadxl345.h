@@ -194,11 +194,6 @@ protected:
     std::mutex ip_mtx;
 };
 
-class Activity {
-public:
-    virtual void resolver( void *payload ){ cout << "aieee" << endl;}
-};
-
 
 class Cadxl345 : public CiicDevice, public Cadxl345Config, public Cadxl345IPProfile
 {
